@@ -1,0 +1,494 @@
+package management
+
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
+	"testing"
+
+	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	sdkconfig "github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
+)
+
+func TestAPICallUsesRequestProxyURL(t *testing.T) {
+	t.Parallel()
+
+	proxyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte("proxied"))
+	}))
+	defer proxyServer.Close()
+
+	h := &Handler{
+		cfg: &config.Config{
+			SDKConfig: sdkconfig.SDKConfig{ProxyURL: "http://127.0.0.1:1"},
+		},
+	}
+	router := gin.New()
+	router.POST("/", h.APICall)
+
+	body := `{"method":"GET","url":"http://upstream.invalid/test","proxy_url":"` + proxyServer.URL + `"}`
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status code = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+
+	var response apiCallResponse
+	if errDecode := json.NewDecoder(recorder.Body).Decode(&response); errDecode != nil {
+		t.Fatalf("decode response: %v", errDecode)
+	}
+	if response.StatusCode != http.StatusCreated {
+		t.Fatalf("upstream status code = %d, want %d", response.StatusCode, http.StatusCreated)
+	}
+	if response.Body != "proxied" {
+		t.Fatalf("upstream body = %q, want %q", response.Body, "proxied")
+	}
+}
+
+func TestAPICallTransportDirectBypassesGlobalProxy(t *testing.T) {
+	t.Parallel()
+
+	h := &Handler{
+		cfg: &config.Config{
+			SDKConfig: sdkconfig.SDKConfig{ProxyURL: "http://global-proxy.example.com:8080"},
+		},
+	}
+
+	transport := h.apiCallTransport(&coreauth.Auth{ProxyURL: "direct"}, "")
+	httpTransport, ok := transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport type = %T, want *http.Transport", transport)
+	}
+	if httpTransport.Proxy != nil {
+		t.Fatal("expected direct transport to disable proxy function")
+	}
+}
+
+func TestAPICallTransportInvalidAuthFallsBackToGlobalProxy(t *testing.T) {
+	t.Parallel()
+
+	h := &Handler{
+		cfg: &config.Config{
+			SDKConfig: sdkconfig.SDKConfig{ProxyURL: "http://global-proxy.example.com:8080"},
+		},
+	}
+
+	transport := h.apiCallTransport(&coreauth.Auth{ProxyURL: "bad-value"}, "")
+	httpTransport, ok := transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport type = %T, want *http.Transport", transport)
+	}
+
+	req, errRequest := http.NewRequest(http.MethodGet, "https://example.com", nil)
+	if errRequest != nil {
+		t.Fatalf("http.NewRequest returned error: %v", errRequest)
+	}
+
+	proxyURL, errProxy := httpTransport.Proxy(req)
+	if errProxy != nil {
+		t.Fatalf("httpTransport.Proxy returned error: %v", errProxy)
+	}
+	if proxyURL == nil || proxyURL.String() != "http://global-proxy.example.com:8080" {
+		t.Fatalf("proxy URL = %v, want http://global-proxy.example.com:8080", proxyURL)
+	}
+}
+
+func TestAPICallTransportRequestProxyOverridesCredentialAndGlobalProxy(t *testing.T) {
+	t.Parallel()
+
+	h := &Handler{
+		cfg: &config.Config{
+			SDKConfig: sdkconfig.SDKConfig{ProxyURL: "http://global-proxy.example.com:8080"},
+		},
+	}
+	auth := &coreauth.Auth{ProxyURL: "http://credential-proxy.example.com:8080"}
+
+	transport := h.apiCallTransport(auth, " http://request-proxy.example.com:8080 ")
+	httpTransport, ok := transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport type = %T, want *http.Transport", transport)
+	}
+
+	req, errRequest := http.NewRequest(http.MethodGet, "https://example.com", nil)
+	if errRequest != nil {
+		t.Fatalf("http.NewRequest returned error: %v", errRequest)
+	}
+
+	proxyURL, errProxy := httpTransport.Proxy(req)
+	if errProxy != nil {
+		t.Fatalf("httpTransport.Proxy returned error: %v", errProxy)
+	}
+	if proxyURL == nil || proxyURL.String() != "http://request-proxy.example.com:8080" {
+		t.Fatalf("proxy URL = %v, want http://request-proxy.example.com:8080", proxyURL)
+	}
+}
+
+func TestAPICallTransportInvalidRequestProxyDoesNotFallBack(t *testing.T) {
+	t.Parallel()
+
+	h := &Handler{
+		cfg: &config.Config{
+			SDKConfig: sdkconfig.SDKConfig{ProxyURL: "http://global-proxy.example.com:8080"},
+		},
+	}
+	auth := &coreauth.Auth{ProxyURL: "http://credential-proxy.example.com:8080"}
+
+	transport := h.apiCallTransport(auth, "bad-value")
+	httpTransport, ok := transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport type = %T, want *http.Transport", transport)
+	}
+	if httpTransport.Proxy != nil {
+		t.Fatal("expected invalid request proxy to avoid lower-priority proxy settings")
+	}
+}
+
+func TestAPICallTransportAPIKeyAuthFallsBackToConfigProxyURL(t *testing.T) {
+	t.Parallel()
+
+	h := &Handler{
+		cfg: &config.Config{
+			SDKConfig: sdkconfig.SDKConfig{ProxyURL: "http://global-proxy.example.com:8080"},
+			GeminiKey: []config.GeminiKey{{
+				APIKey:   "gemini-key",
+				ProxyURL: "http://gemini-proxy.example.com:8080",
+			}},
+			ClaudeKey: []config.ClaudeKey{{
+				APIKey:   "claude-key",
+				ProxyURL: "http://claude-proxy.example.com:8080",
+			}},
+			CodexKey: []config.CodexKey{{
+				APIKey:   "codex-key",
+				ProxyURL: "http://codex-proxy.example.com:8080",
+			}},
+			XAIKey: []config.XAIKey{{
+				APIKey:   "xai-key",
+				ProxyURL: "http://xai-proxy.example.com:8080",
+			}},
+			MetaKey: []config.MetaKey{{
+				APIKey:   "meta-key",
+				ProxyURL: "http://meta-proxy.example.com:8080",
+			}},
+			OpenAICompatibility: []config.OpenAICompatibility{{
+				Name:    "bohe",
+				BaseURL: "https://bohe.example.com",
+				APIKeyEntries: []config.OpenAICompatibilityAPIKey{{
+					APIKey:   "compat-key",
+					ProxyURL: "http://compat-proxy.example.com:8080",
+				}},
+			}},
+		},
+	}
+
+	cases := []struct {
+		name      string
+		auth      *coreauth.Auth
+		wantProxy string
+	}{
+		{
+			name: "gemini",
+			auth: &coreauth.Auth{
+				Provider:   "gemini",
+				Attributes: map[string]string{"api_key": "gemini-key"},
+			},
+			wantProxy: "http://gemini-proxy.example.com:8080",
+		},
+		{
+			name: "claude",
+			auth: &coreauth.Auth{
+				Provider:   "claude",
+				Attributes: map[string]string{"api_key": "claude-key"},
+			},
+			wantProxy: "http://claude-proxy.example.com:8080",
+		},
+		{
+			name: "codex",
+			auth: &coreauth.Auth{
+				Provider:   "codex",
+				Attributes: map[string]string{"api_key": "codex-key"},
+			},
+			wantProxy: "http://codex-proxy.example.com:8080",
+		},
+		{
+			name: "xai",
+			auth: &coreauth.Auth{
+				Provider:   "xai",
+				Attributes: map[string]string{"api_key": "xai-key"},
+			},
+			wantProxy: "http://xai-proxy.example.com:8080",
+		},
+		{
+			name: "meta",
+			auth: &coreauth.Auth{
+				Provider:   "meta",
+				Attributes: map[string]string{"api_key": "meta-key"},
+			},
+			wantProxy: "http://meta-proxy.example.com:8080",
+		},
+		{
+			name: "openai-compatibility",
+			auth: &coreauth.Auth{
+				Provider: "bohe",
+				Attributes: map[string]string{
+					"api_key":      "compat-key",
+					"compat_name":  "bohe",
+					"provider_key": "bohe",
+				},
+			},
+			wantProxy: "http://compat-proxy.example.com:8080",
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			transport := h.apiCallTransport(tc.auth, "")
+			httpTransport, ok := transport.(*http.Transport)
+			if !ok {
+				t.Fatalf("transport type = %T, want *http.Transport", transport)
+			}
+
+			req, errRequest := http.NewRequest(http.MethodGet, "https://example.com", nil)
+			if errRequest != nil {
+				t.Fatalf("http.NewRequest returned error: %v", errRequest)
+			}
+
+			proxyURL, errProxy := httpTransport.Proxy(req)
+			if errProxy != nil {
+				t.Fatalf("httpTransport.Proxy returned error: %v", errProxy)
+			}
+			if proxyURL == nil || proxyURL.String() != tc.wantProxy {
+				t.Fatalf("proxy URL = %v, want %s", proxyURL, tc.wantProxy)
+			}
+		})
+	}
+}
+
+func TestAuthByIndexDistinguishesSharedAPIKeysAcrossProviders(t *testing.T) {
+	t.Parallel()
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	geminiAuth := &coreauth.Auth{
+		ID:       "gemini:apikey:123",
+		Provider: "gemini",
+		Attributes: map[string]string{
+			"api_key": "shared-key",
+		},
+	}
+	compatAuth := &coreauth.Auth{
+		ID:       "openai-compatibility:bohe:456",
+		Provider: "bohe",
+		Label:    "bohe",
+		Attributes: map[string]string{
+			"api_key":      "shared-key",
+			"compat_name":  "bohe",
+			"provider_key": "bohe",
+		},
+	}
+
+	if _, errRegister := manager.Register(context.Background(), geminiAuth); errRegister != nil {
+		t.Fatalf("register gemini auth: %v", errRegister)
+	}
+	if _, errRegister := manager.Register(context.Background(), compatAuth); errRegister != nil {
+		t.Fatalf("register compat auth: %v", errRegister)
+	}
+
+	geminiIndex := geminiAuth.EnsureIndex()
+	compatIndex := compatAuth.EnsureIndex()
+	if geminiIndex == compatIndex {
+		t.Fatalf("shared api key produced duplicate auth_index %q", geminiIndex)
+	}
+
+	h := &Handler{authManager: manager}
+
+	gotGemini := h.authByIndex(geminiIndex)
+	if gotGemini == nil {
+		t.Fatal("expected gemini auth by index")
+	}
+	if gotGemini.ID != geminiAuth.ID {
+		t.Fatalf("authByIndex(gemini) returned %q, want %q", gotGemini.ID, geminiAuth.ID)
+	}
+
+	gotCompat := h.authByIndex(compatIndex)
+	if gotCompat == nil {
+		t.Fatal("expected compat auth by index")
+	}
+	if gotCompat.ID != compatAuth.ID {
+		t.Fatalf("authByIndex(compat) returned %q, want %q", gotCompat.ID, compatAuth.ID)
+	}
+}
+
+func TestAPICallReplacesTokenInBodyData(t *testing.T) {
+	t.Parallel()
+
+	var receivedBody string
+	upstreamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		receivedBody = string(b)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstreamServer.Close()
+
+	manager := coreauth.NewManager(nil, &coreauth.RoundRobinSelector{}, nil)
+	devinAuth := &coreauth.Auth{
+		ID:       "devin-test.json",
+		Provider: "devin",
+		Attributes: map[string]string{
+			"api_key": "secret-session-token-xyz",
+		},
+		Metadata: map[string]any{
+			"type":    "devin",
+			"api_key": "secret-session-token-xyz",
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), devinAuth); errRegister != nil {
+		t.Fatalf("register devin auth: %v", errRegister)
+	}
+	authIndex := devinAuth.EnsureIndex()
+
+	h := &Handler{
+		cfg:         &config.Config{},
+		authManager: manager,
+	}
+	router := gin.New()
+	router.POST("/", h.APICall)
+
+	reqPayload := map[string]any{
+		"method":     "POST",
+		"url":        upstreamServer.URL,
+		"auth_index": authIndex,
+		"header": map[string]string{
+			"Content-Type": "application/json",
+		},
+		"data": `{"metadata":{"apiKey":"$TOKEN$","ideName":"chisel"}}`,
+	}
+	reqBytes, _ := json.Marshal(reqPayload)
+
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(string(reqBytes)))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status code = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	expectedBody := `{"metadata":{"apiKey":"secret-session-token-xyz","ideName":"chisel"}}`
+	if receivedBody != expectedBody {
+		t.Fatalf("received body = %q, want %q", receivedBody, expectedBody)
+	}
+}
+
+type failingMetaTokenStore struct {
+	memoryAuthStore
+	err error
+}
+
+func (s *failingMetaTokenStore) Save(context.Context, *coreauth.Auth) (string, error) {
+	return "", s.err
+}
+
+func TestAPICallRejectsUnresolvedTokenPlaceholder(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name    string
+		body    map[string]any
+		wantErr []string
+	}{
+		{
+			name: "omitted auth_index in header",
+			body: map[string]any{
+				"method": "GET",
+				"header": map[string]string{"Authorization": "Bearer $TOKEN$"},
+			},
+			wantErr: []string{"auth token not found"},
+		},
+		{
+			name: "omitted auth_index in data",
+			body: map[string]any{
+				"method": "POST",
+				"data":   `{"apiKey":"$TOKEN$"}`,
+			},
+			wantErr: []string{"auth token not found"},
+		},
+		{
+			name: "unmatched auth_index",
+			body: map[string]any{
+				"auth_index": "missing-auth-index",
+				"authIndex":  "missing-auth-index",
+				"method":     "GET",
+				"header":     map[string]string{"Authorization": "Bearer $TOKEN$"},
+			},
+			wantErr: []string{"auth token not found", "auth credential not found for auth_index"},
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			var upstreamHit atomic.Bool
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				upstreamHit.Store(true)
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer upstream.Close()
+
+			manager := coreauth.NewManager(nil, nil, nil)
+			h := &Handler{cfg: &config.Config{}, authManager: manager}
+			router := gin.New()
+			router.POST("/", h.APICall)
+
+			payload := map[string]any{}
+			for k, v := range tc.body {
+				payload[k] = v
+			}
+			payload["url"] = upstream.URL + "/test"
+			bodyBytes, errMarshal := json.Marshal(payload)
+			if errMarshal != nil {
+				t.Fatalf("marshal request: %v", errMarshal)
+			}
+
+			recorder := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(string(bodyBytes)))
+			req.Header.Set("Content-Type", "application/json")
+			router.ServeHTTP(recorder, req)
+
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status code = %d, want %d; body = %s", recorder.Code, http.StatusBadRequest, recorder.Body.String())
+			}
+			var errBody map[string]any
+			if errDecode := json.Unmarshal(recorder.Body.Bytes(), &errBody); errDecode != nil {
+				t.Fatalf("decode error body: %v; body = %s", errDecode, recorder.Body.String())
+			}
+			gotErr, _ := errBody["error"].(string)
+			matched := false
+			for _, want := range tc.wantErr {
+				if gotErr == want {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				t.Fatalf("error = %q, want one of %q", gotErr, tc.wantErr)
+			}
+			if upstreamHit.Load() {
+				t.Fatal("upstream must not receive a request when $TOKEN$ cannot be resolved")
+			}
+		})
+	}
+}
