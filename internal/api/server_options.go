@@ -9,6 +9,8 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/pricing"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/usagehistory"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
@@ -25,6 +27,8 @@ type serverOptionConfig struct {
 	postAuthHook          auth.PostAuthHook
 	postAuthPersistHook   auth.PostAuthHook
 	pluginHost            *pluginhost.Host
+	usageHistory          *usagehistory.History
+	pricingCatalog        *pricing.Catalog
 	configReloadHook      func(context.Context, *config.Config)
 	exampleAPIKeySafeMode bool
 }
@@ -118,6 +122,20 @@ func WithPostAuthPersistHook(hook auth.PostAuthHook) ServerOption {
 func WithPluginHost(host *pluginhost.Host) ServerOption {
 	return func(cfg *serverOptionConfig) {
 		cfg.pluginHost = host
+	}
+}
+
+// WithUsageHistory registers the native usage history queried by management endpoints.
+func WithUsageHistory(history *usagehistory.History) ServerOption {
+	return func(cfg *serverOptionConfig) {
+		cfg.usageHistory = history
+	}
+}
+
+// WithPricingCatalog registers the native pricing catalog queried by management endpoints.
+func WithPricingCatalog(catalog *pricing.Catalog) ServerOption {
+	return func(cfg *serverOptionConfig) {
+		cfg.pricingCatalog = catalog
 	}
 }
 

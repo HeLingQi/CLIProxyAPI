@@ -139,7 +139,10 @@ retain the corresponding business operation's fields.
 | `/observability/logs/errors/<name>` | GET | Download an error-log file. |
 | `/observability/logs/requests/<id>` | GET | Get a request log. |
 | `/observability/usage/api-keys` | GET | Get API-key usage. |
-| `/observability/usage/queue` | GET | Get queued usage events. |
+| `/observability/usage/queue` | GET | Pop queued usage events for external consumers. |
+| `/observability/usage/summary?from=<date>&to=<date>` | GET | Get native persisted daily usage totals for an inclusive UTC date range. |
+| `/observability/usage/events?limit=<n>&before=<sequence>` | GET | Get newest-first redacted native request events. |
+| `/observability/pricing/models` | GET, PUT, DELETE | Read or mutate the revisioned native model price catalog. |
 | `/credentials` | GET, POST, DELETE | List, upload, or delete credential files. |
 | `/credentials/models` | GET | Get credential models. |
 | `/credentials/download` | GET | Download a credential file. |
@@ -159,6 +162,76 @@ retain the corresponding business operation's fields.
 | `/plugins/store` | GET | List the plugin store (supports optional `?refresh=true` to bypass cached release checks). |
 | `/plugins/store/<id>/install` | POST | Install or update a plugin. |
 | `/plugins/<id>/quota` | GET, POST, DELETE | Read, fetch, or reset plugin quota. |
+
+### Native usage history
+
+Set `observability.usage.usage-statistics-enabled` to `true` to collect native
+history. Collection subscribes directly to the normalized in-process usage record;
+it does not consume or remove records from `/observability/usage/queue`. Data uses
+the existing `server.kv-store`: local bbolt in standalone mode and Home KV in Home
+mode. Disabling the KV store keeps the current process's daily summary in memory,
+but request-event history is unavailable and no data survives restart.
+
+`GET /observability/usage/summary` requires `from` and `to` in `YYYY-MM-DD`
+format. The dates are inclusive UTC boundaries and may span at most 366 days. The
+response contains additive `totals` and one `days` row per calendar date, including
+zero-value dates. Token totals use the canonical non-overlapping accounting fields.
+`reported_cost_usd_micros` is an integer number of USD micro-units reported by the
+upstream provider. `estimated_cost_usd_micros` is calculated from the active native
+price catalog, while `effective_cost_usd_micros` uses the upstream amount when it is
+available and otherwise falls back to the estimate. Request events also include
+`cost_source` (`upstream` or `catalog`) and the `pricing_revision` used for lookup.
+Latency and TTFT values are accumulated milliseconds, not averages.
+
+`GET /observability/usage/events` accepts `limit` from 1 through 200 (default 50)
+and an optional exclusive `before` sequence. Results are newest first. Pass
+`next_before` to the next request when it is present. Events are retained in the
+configured KV store without automatic pruning. To limit sensitive data exposure,
+the records never persist raw API keys, failure bodies, response headers, or client
+IP addresses. A nonempty API key is represented only by a short SHA-256 fingerprint;
+string fields are bounded to 4 KiB. Both endpoints use the normal management
+authentication and remote-access policy.
+
+The built-in TUI exposes these endpoints in its **Usage** tab, showing the latest
+30-day totals, daily request/token trend, reported/estimated/effective cost, and
+recent redacted request events.
+
+### Native pricing catalog
+
+The catalog stores one required base-price set per exact `provider` and `model`.
+Prices are JSON numbers in USD per one million tokens with at most six decimal
+places. Input, output, cache-read, and cache-write prices are independent. Resolution
+tries the upstream response model first, then the requested model and its alias.
+Calculations use fixed-point integers; catalog estimates never overwrite an upstream
+reported cost.
+
+`GET /observability/pricing/models` returns the current `revision` and sorted `models`.
+Create or replace an entry with a complete request:
+
+```json
+{
+  "revision": 0,
+  "provider": "openai",
+  "model": "gpt-5.4",
+  "base_prices": {
+    "input": 1.25,
+    "output": 4,
+    "cache_read": 0.1,
+    "cache_write": 0.2
+  }
+}
+```
+
+Send it with `PUT /observability/pricing/models`. Delete with
+`DELETE /observability/pricing/models?revision=<revision>&provider=<provider>&model=<model>`.
+Every mutation increments the revision. A stale revision returns HTTP 409, so clients
+must reload before retrying. The complete catalog is atomically persisted in the
+active bbolt/Home KV store and other processes refresh it periodically. Writes return
+HTTP 503 when KV persistence is disabled.
+
+This first native phase applies prices only to new usage records. It does not run
+historical recalculation, import Keeper SQLite files, apply conditional price branches,
+or automatically overwrite prices from an external metadata source.
 
 ## OAuth
 

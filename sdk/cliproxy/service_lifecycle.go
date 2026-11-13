@@ -9,9 +9,11 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/api"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/home"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/pricing"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/usagehistory"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v8/sdk/access"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
@@ -57,6 +59,10 @@ func (s *Service) Run(ctx context.Context) error {
 
 	usage.StartDefault(ctx)
 	cfg := s.currentConfig()
+	if cfg != nil {
+		redisqueue.SetUsageStatisticsEnabled(cfg.UsageStatisticsEnabled)
+		redisqueue.SetRetentionSeconds(cfg.RedisUsageQueueRetentionSeconds)
+	}
 	homeEnabled := cfg != nil && cfg.Home.Enabled
 	if homeEnabled {
 		s.cfgMu.Lock()
@@ -81,6 +87,15 @@ func (s *Service) Run(ctx context.Context) error {
 		}
 		s.applyKVStoreConfig(cfg)
 	}
+
+	pricingCatalog, errPricing := pricing.NewCatalog(ctx)
+	if errPricing != nil {
+		return fmt.Errorf("load pricing catalog: %w", errPricing)
+	}
+	s.pricingCatalog = pricingCatalog
+	go s.pricingCatalog.Run(ctx)
+	s.usageHistory = usagehistory.New(redisqueue.UsageStatisticsEnabled, s.pricingCatalog)
+	usage.RegisterNamedPlugin("native-usage-history", s.usageHistory)
 
 	s.applyRetryConfig(cfg)
 	s.configureCooldownStateStore(cfg)
@@ -135,7 +150,9 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 
 	// handlers no longer depend on legacy clients; pass nil slice initially
-	s.server = api.NewServer(cfg, s.coreManager, s.accessManager, s.configPath, s.serverOptions...)
+	serverOptions := append([]api.ServerOption(nil), s.serverOptions...)
+	serverOptions = append(serverOptions, api.WithUsageHistory(s.usageHistory), api.WithPricingCatalog(s.pricingCatalog))
+	s.server = api.NewServer(cfg, s.coreManager, s.accessManager, s.configPath, serverOptions...)
 	s.syncPluginRuntimeConfig(ctx)
 	if homeEnabled {
 		s.configRuntimeMu.Lock()
@@ -391,6 +408,23 @@ func (s *Service) Shutdown(ctx context.Context) error {
 			}
 		}
 
+		if errStopUsage := usage.StopDefaultContext(ctx); errStopUsage != nil {
+			log.Errorf("failed to drain usage delivery: %v", errStopUsage)
+			if shutdownErr == nil {
+				shutdownErr = errStopUsage
+			}
+		}
+		if s.usageHistory != nil {
+			if errCloseHistory := s.usageHistory.Close(ctx); errCloseHistory != nil {
+				log.Errorf("failed to flush usage history: %v", errCloseHistory)
+				if shutdownErr == nil {
+					shutdownErr = errCloseHistory
+				}
+			}
+			s.usageHistory = nil
+		}
+		s.pricingCatalog = nil
+
 		if errShutdownKV := s.shutdownKVStore(); errShutdownKV != nil {
 			log.Errorf("failed to stop local kv store: %v", errShutdownKV)
 			if shutdownErr == nil {
@@ -399,7 +433,6 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		}
 
 		helps.RetireProxyPoolPublisher(s.proxyPoolPublisher)
-		usage.StopDefault()
 	})
 	return shutdownErr
 }

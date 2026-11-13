@@ -18,6 +18,8 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginstore"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/pricing"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/usagehistory"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
@@ -56,6 +58,8 @@ type Handler struct {
 	postAuthHook            coreauth.PostAuthHook
 	postAuthPersistHook     coreauth.PostAuthHook
 	pluginHost              *pluginhost.Host
+	usageHistory            *usagehistory.History
+	pricingCatalog          *pricing.Catalog
 	configReloadHook        func(context.Context, *config.Config)
 	pluginStoreRegistryURL  string
 	pluginStoreHTTPClient   pluginstore.HTTPDoer
@@ -206,6 +210,26 @@ func (h *Handler) SetPluginHost(host *pluginhost.Host) {
 	if h.pluginHost != host {
 		h.pluginHost = host
 	}
+	h.mu.Unlock()
+}
+
+// SetUsageHistory updates the native usage history queried by management endpoints.
+func (h *Handler) SetUsageHistory(history *usagehistory.History) {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	h.usageHistory = history
+	h.mu.Unlock()
+}
+
+// SetPricingCatalog updates the native pricing catalog queried by management endpoints.
+func (h *Handler) SetPricingCatalog(catalog *pricing.Catalog) {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	h.pricingCatalog = catalog
 	h.mu.Unlock()
 }
 

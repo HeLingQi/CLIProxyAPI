@@ -13,6 +13,8 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/homeplugins"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/pricing"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/usagehistory"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/watcher"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/wsrelay"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v8/sdk/access"
@@ -109,6 +111,12 @@ type Service struct {
 
 	// pluginHost owns dynamic plugin lifecycle and runtime capability adapters.
 	pluginHost *pluginhost.Host
+
+	// usageHistory persists native daily usage aggregates through the shared KV store.
+	usageHistory *usagehistory.History
+
+	// pricingCatalog resolves fixed-point estimates from the shared KV-backed model catalog.
+	pricingCatalog *pricing.Catalog
 
 	// shutdownOnce ensures shutdown is called only once.
 	shutdownOnce sync.Once

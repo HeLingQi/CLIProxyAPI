@@ -1182,7 +1182,9 @@ observability:
     request-log: false
 
   usage:
-    # When false, disable in-memory usage statistics aggregation
+    # Record native usage history and publish usage queue events. Daily summaries, redacted
+    # request events, and the model price catalog use server.kv-store (local bbolt or Home KV);
+    # false stops new usage collection but does not delete the configured price catalog.
     usage-statistics-enabled: false
 
     # How long (in seconds) usage queue items are retained in memory for the Management API.

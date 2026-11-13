@@ -640,6 +640,7 @@ type Manager struct {
 	once     sync.Once
 	stopOnce sync.Once
 	cancel   context.CancelFunc
+	done     chan struct{}
 
 	mu     sync.Mutex
 	cond   *sync.Cond
@@ -653,7 +654,7 @@ type Manager struct {
 
 // NewManager constructs a manager with a buffered queue.
 func NewManager(buffer int) *Manager {
-	m := &Manager{}
+	m := &Manager{done: make(chan struct{})}
 	m.cond = sync.NewCond(&m.mu)
 	return m
 }
@@ -669,16 +670,30 @@ func (m *Manager) Start(ctx context.Context) {
 		}
 		var workerCtx context.Context
 		workerCtx, m.cancel = context.WithCancel(ctx)
-		go m.run(workerCtx)
+		go func() {
+			defer close(m.done)
+			m.run(workerCtx)
+		}()
 	})
 }
 
 // Stop stops the dispatcher and drains the queue.
 func (m *Manager) Stop() {
+	_ = m.StopContext(context.Background())
+}
+
+// StopContext stops the dispatcher, drains queued records, and waits for in-flight delivery.
+func (m *Manager) StopContext(ctx context.Context) error {
 	if m == nil {
-		return
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 	m.stopOnce.Do(func() {
+		// Start guarantees there is a dispatcher to drain records even when Stop
+		// is the first lifecycle call.
+		m.Start(context.Background())
 		if m.cancel != nil {
 			m.cancel()
 		}
@@ -687,6 +702,12 @@ func (m *Manager) Stop() {
 		m.mu.Unlock()
 		m.cond.Broadcast()
 	})
+	select {
+	case <-m.done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // Register appends a plugin to the delivery list.
@@ -843,3 +864,6 @@ func StartDefault(ctx context.Context) { DefaultManager().Start(ctx) }
 
 // StopDefault stops the default manager's dispatcher.
 func StopDefault() { DefaultManager().Stop() }
+
+// StopDefaultContext stops the default dispatcher while honoring ctx.
+func StopDefaultContext(ctx context.Context) error { return DefaultManager().StopContext(ctx) }

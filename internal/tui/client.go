@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/usagehistory"
 )
 
 // Client wraps HTTP calls to the management API.
@@ -143,6 +145,46 @@ func (c *Client) postJSON(path string, body any) error {
 // GetConfig fetches the parsed config.
 func (c *Client) GetConfig() (map[string]any, error) {
 	return c.getJSON("/v0/management/config")
+}
+
+// GetUsageSummary fetches native persisted usage aggregates for an inclusive UTC date range.
+func (c *Client) GetUsageSummary(from, to string) (usagehistory.Summary, error) {
+	query := url.Values{}
+	query.Set("from", from)
+	query.Set("to", to)
+	data, errGet := c.get("/v8/management/observability/usage/summary?" + query.Encode())
+	if errGet != nil {
+		return usagehistory.Summary{}, errGet
+	}
+	var summary usagehistory.Summary
+	if errUnmarshal := json.Unmarshal(data, &summary); errUnmarshal != nil {
+		return usagehistory.Summary{}, errUnmarshal
+	}
+	return summary, nil
+}
+
+// GetUsageEvents fetches newest-first redacted native usage events.
+func (c *Client) GetUsageEvents(limit int, before int64) (usagehistory.EventsPage, error) {
+	query := url.Values{}
+	if limit > 0 {
+		query.Set("limit", strconv.Itoa(limit))
+	}
+	if before > 0 {
+		query.Set("before", strconv.FormatInt(before, 10))
+	}
+	path := "/v8/management/observability/usage/events"
+	if encoded := query.Encode(); encoded != "" {
+		path += "?" + encoded
+	}
+	data, errGet := c.get(path)
+	if errGet != nil {
+		return usagehistory.EventsPage{}, errGet
+	}
+	var page usagehistory.EventsPage
+	if errUnmarshal := json.Unmarshal(data, &page); errUnmarshal != nil {
+		return usagehistory.EventsPage{}, errUnmarshal
+	}
+	return page, nil
 }
 
 // GetConfigYAML fetches the raw config.yaml content.
