@@ -85,6 +85,10 @@ type ModelInfo struct {
 	// SupportsWebSearch indicates this Antigravity model is listed by
 	// fetchAvailableModels.webSearchModelIds and can execute native googleSearch.
 	SupportsWebSearch bool `json:"supports_web_search,omitempty"`
+	// ModelEnum is the internal model identifier the Antigravity account catalog reports for
+	// this model, for example MODEL_PLACEHOLDER_M318. The CLI echoes it as a request label and
+	// in the trajectory report, so it stays internal and is never listed.
+	ModelEnum string `json:"-"`
 
 	// SupportConfigurationUpdate reports internal support for configuration_update.
 	SupportConfigurationUpdate bool `json:"-"`

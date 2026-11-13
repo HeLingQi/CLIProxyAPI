@@ -247,6 +247,13 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 					streamErr = deliveryErr
 				}
 			}
+			// The CLI traces the turn right after the stream ends, including when the client
+			// hangs up after receiving the terminal chunk and the context is already cancelled.
+			if terminalDelivered {
+				if detail, okDetail := streamUsage.Detail(); okDetail {
+					e.reportAntigravityAgentTurn(ctx, auth, token, httpReq, baseModel, detail)
+				}
+			}
 			if streamErr != nil {
 				if terminalDelivered && errors.Is(streamErr, context.Canceled) {
 					streamUsage.Publish(ctx, reporter)

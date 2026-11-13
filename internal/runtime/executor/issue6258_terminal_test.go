@@ -72,7 +72,7 @@ func issue6258Executor(t *testing.T, provider, baseURL string) (context.Context,
 	case "antigravity":
 		auth.Attributes = map[string]string{"base_url": baseURL}
 		auth.Metadata = map[string]any{"access_token": "test-token", "expired": time.Now().Add(24 * time.Hour).Format(time.RFC3339), "project_id": "proxy-test"}
-		return ctx, NewAntigravityExecutor(cfg), auth
+		return ctx, NewAntigravityExecutor(antigravityNoControlPlane(cfg)), auth
 	default:
 		t.Fatalf("unknown provider %q", provider)
 		return nil, nil, nil

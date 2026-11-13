@@ -253,7 +253,7 @@ func TestInteractionsAntigravityModelUsesTranslatorBridge(t *testing.T) {
 	defer server.Close()
 
 	manager := coreauth.NewManager(nil, nil, nil)
-	manager.RegisterExecutor(executor.NewAntigravityExecutor(&config.Config{RequestRetry: 1}))
+	manager.RegisterExecutor(executor.NewAntigravityExecutor(&config.Config{Antigravity: config.AntigravityConfig{DisableControlPlane: true}, RequestRetry: 1}))
 	auth := &coreauth.Auth{
 		ID:       "interactions-antigravity-bridge-auth",
 		Provider: "antigravity",

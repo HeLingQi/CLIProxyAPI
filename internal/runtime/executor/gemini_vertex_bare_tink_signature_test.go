@@ -91,7 +91,7 @@ func TestAntigravityExecutorReplacesVertexBareTinkSignature(t *testing.T) {
 	}))
 	defer server.Close()
 
-	exec := NewAntigravityExecutor(&config.Config{RequestRetry: 1})
+	exec := NewAntigravityExecutor(antigravityNoControlPlane(&config.Config{RequestRetry: 1}))
 	auth := testAntigravityAuth(server.URL)
 	auth.Metadata["project_id"] = "project-1"
 	req := cliproxyexecutor.Request{Model: "gemini-3.6-flash-high", Payload: vertexBareTinkGeminiHistory(sig)}

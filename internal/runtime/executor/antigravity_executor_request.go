@@ -64,7 +64,8 @@ func (e *AntigravityExecutor) buildRequestDoc(ctx context.Context, auth *cliprox
 	if errProject != nil {
 		return nil, nil, errProject
 	}
-	geminiToAntigravityDoc(doc, modelName, projectID, derivedSessionIDs...)
+	var agentCall *antigravityCallIdentity
+	agentCall = geminiToAntigravityDoc(doc, modelName, projectID, derivedSessionIDs...)
 	promptStructuredOutput := helps.PrepareAntigravityClaudeStructuredOutputDoc(modelName, doc)
 
 	// Cap maxOutputTokens to model's max_completion_tokens from registry
@@ -104,10 +105,15 @@ func (e *AntigravityExecutor) buildRequestDoc(ctx context.Context, auth *cliprox
 	if errReq != nil {
 		return nil, nil, errReq
 	}
-	// Deliberately no httpReq.Close: the native Antigravity client omits the
-	// Connection header and keeps its HTTP/1.1 connections alive, so forcing
-	// "Connection: close" would both deviate from that fingerprint and defeat the
-	// shared connection pool by discarding every established TCP + TLS session.
+	if agentCall != nil {
+		// The trajectory report of this conversation has to reuse the identifiers the request
+		// advertised, so they travel with the request the caller already holds.
+		httpReq = httpReq.WithContext(withAntigravityCallIdentity(httpReq.Context(), *agentCall))
+	}
+	// Deliberately no httpReq.Close: the native Antigravity client omits the Connection
+	// header and keeps its connections alive, so forcing "Connection: close" would both
+	// deviate from that fingerprint and defeat the shared connection pool by discarding
+	// every established TCP + TLS session.
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Authorization", "Bearer "+token)
 	httpReq.Header.Set("User-Agent", resolveUserAgent(auth))
@@ -721,9 +727,9 @@ func geminiToAntigravity(modelName string, payload []byte, projectID string, der
 	return doc.Bytes()
 }
 
-func geminiToAntigravityDoc(doc *ojson.Doc, modelName string, projectID string, derivedSessionIDs ...string) {
+func geminiToAntigravityDoc(doc *ojson.Doc, modelName string, projectID string, derivedSessionIDs ...string) (agentCall *antigravityCallIdentity) {
 	if doc == nil {
-		return
+		return nil
 	}
 	helps.SetStringIfDifferentDoc(doc, "model", modelName)
 	helps.SetStringIfDifferentDoc(doc, "userAgent", "antigravity")
@@ -748,7 +754,6 @@ func geminiToAntigravityDoc(doc *ojson.Doc, modelName string, projectID string, 
 	if isImageModel {
 		_ = doc.Set("requestId", generateImageGenRequestID())
 	} else if reqType != "web_search" {
-		_ = doc.Set("requestId", generateRequestID())
 		sessionID := strings.TrimSpace(doc.Get("request.sessionId").String())
 		if sessionID == "" && len(derivedSessionIDs) > 0 {
 			sessionID = strings.TrimSpace(derivedSessionIDs[0])
@@ -757,6 +762,16 @@ func geminiToAntigravityDoc(doc *ojson.Doc, modelName string, projectID string, 
 			sessionID = generateStableSessionIDDoc(doc)
 		}
 		_ = doc.Set("request.sessionId", sessionID)
+		if reqType == "agent" {
+			call := nextAntigravityCallIdentity(doc, sessionID, modelName)
+			_ = doc.Set("requestId", antigravityAgentRequestID(call))
+			antigravitySetRequestLabels(doc, call, antigravityModelEnum(modelName))
+			agentCall = &call
+		} else {
+			// shortcut: only agent requests carry the CLI trajectory identity; user and tool
+			// probes keep the legacy random ID, upgrade if upstream starts checking those too.
+			_ = doc.Set("requestId", generateRequestID())
+		}
 	}
 
 	_ = doc.Delete("request.safetySettings")
@@ -764,6 +779,7 @@ func geminiToAntigravityDoc(doc *ojson.Doc, modelName string, projectID string, 
 		_ = doc.SetRawBytes("request.toolConfig", []byte(toolConfig.Raw))
 		_ = doc.Delete("toolConfig")
 	}
+	return agentCall
 }
 
 func generateRequestID() string {

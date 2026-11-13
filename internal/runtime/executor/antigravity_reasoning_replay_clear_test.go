@@ -34,7 +34,7 @@ func TestAntigravityReasoningReplayClearsOnInvalidSignature400(t *testing.T) {
 	}))
 	defer server.Close()
 
-	exec := NewAntigravityExecutor(&config.Config{RequestRetry: 1})
+	exec := NewAntigravityExecutor(antigravityNoControlPlane(&config.Config{RequestRetry: 1}))
 	auth := &cliproxyauth.Auth{
 		ID: "auth-pr3900-invalid-sig",
 		Attributes: map[string]string{

@@ -112,7 +112,7 @@ func TestAntigravityDropsTrailingStructuredReasoningTurn(t *testing.T) {
 			server := issue6530Server(t, captured, tt.stream)
 			defer server.Close()
 
-			executor := NewAntigravityExecutor(&config.Config{RequestRetry: 1})
+			executor := NewAntigravityExecutor(antigravityNoControlPlane(&config.Config{RequestRetry: 1}))
 			auth := testAntigravityAuth(server.URL)
 			auth.Metadata["project_id"] = "project-1"
 			req := cliproxyexecutor.Request{Model: tt.model, Payload: issue6530Payload(tt.model, tt.stream, tt.prefix, tt.summary, tt.content)}

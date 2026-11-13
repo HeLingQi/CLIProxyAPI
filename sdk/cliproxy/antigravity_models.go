@@ -85,11 +85,14 @@ type antigravityModelCapabilityHints struct {
 	WebSearchModelIDs map[string]struct{}
 	// Nil means unknown; an empty non-nil set is an authoritative empty catalog.
 	ModelIDs map[string]struct{}
-	revision uint64
+	// ModelEnums maps model ID to the internal model identifier the Antigravity CLI
+	// echoes back as the request_labels.model_enum field; nil means unknown.
+	ModelEnums map[string]string
+	revision   uint64
 }
 
 func (h antigravityModelCapabilityHints) clone() antigravityModelCapabilityHints {
-	return antigravityModelCapabilityHints{WebSearchModelIDs: maps.Clone(h.WebSearchModelIDs), ModelIDs: maps.Clone(h.ModelIDs), revision: h.revision}
+	return antigravityModelCapabilityHints{WebSearchModelIDs: maps.Clone(h.WebSearchModelIDs), ModelIDs: maps.Clone(h.ModelIDs), ModelEnums: maps.Clone(h.ModelEnums), revision: h.revision}
 }
 
 // antigravityCapabilityKey isolates catalogs by account, project, route and client
@@ -218,6 +221,7 @@ func (s *Service) persistAntigravityCapabilityHints(ctx context.Context, auth *c
 func buildPersistedAntigravityCapabilityHintsValue(project, endpoint string, hints antigravityModelCapabilityHints) map[string]any {
 	return sdkauth.BuildPersistedAntigravityCapabilityHints(project, endpoint, sdkauth.AntigravityModelCapabilityHints{
 		ModelIDs:          hints.ModelIDs,
+		ModelEnums:        hints.ModelEnums,
 		WebSearchModelIDs: hints.WebSearchModelIDs,
 	})
 }
@@ -229,6 +233,7 @@ func parsePersistedAntigravityCapabilityHints(metadata map[string]any, expectedP
 	}
 	return antigravityModelCapabilityHints{
 		ModelIDs:          hints.ModelIDs,
+		ModelEnums:        hints.ModelEnums,
 		WebSearchModelIDs: hints.WebSearchModelIDs,
 	}, true
 }
@@ -369,6 +374,7 @@ func (s *Service) probeAntigravityModelCapabilityHints(ctx context.Context, auth
 	})
 	return antigravityModelCapabilityHints{
 		ModelIDs:          hints.ModelIDs,
+		ModelEnums:        hints.ModelEnums,
 		WebSearchModelIDs: hints.WebSearchModelIDs,
 	}, status
 }
@@ -437,12 +443,13 @@ func parseAntigravityModelCapabilityHints(body []byte) (antigravityModelCapabili
 	}
 	return antigravityModelCapabilityHints{
 		ModelIDs:          hints.ModelIDs,
+		ModelEnums:        hints.ModelEnums,
 		WebSearchModelIDs: hints.WebSearchModelIDs,
 	}, true
 }
 
 func applyAntigravityFetchedModelCapabilities(models []*ModelInfo, hints antigravityModelCapabilityHints) []*ModelInfo {
-	if len(models) == 0 || len(hints.WebSearchModelIDs) == 0 {
+	if len(models) == 0 || (len(hints.WebSearchModelIDs) == 0 && len(hints.ModelEnums) == 0) {
 		return models
 	}
 
@@ -453,6 +460,9 @@ func applyAntigravityFetchedModelCapabilities(models []*ModelInfo, hints antigra
 		modelID := normalizeAntigravityFetchedModelID(model.ID)
 		if _, ok := hints.WebSearchModelIDs[modelID]; ok {
 			model.SupportsWebSearch = true
+		}
+		if enum, ok := hints.ModelEnums[modelID]; ok {
+			model.ModelEnum = enum
 		}
 	}
 	return models

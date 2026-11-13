@@ -47,7 +47,7 @@ func TestAntigravityExecutorExecuteStreamInteractionsEmitsDoneAfterSplitTerminal
 		server.Close()
 	})
 
-	executor := NewAntigravityExecutor(&config.Config{Antigravity: config.AntigravityConfig{}, RequestRetry: 1})
+	executor := NewAntigravityExecutor(antigravityNoControlPlane(&config.Config{Antigravity: config.AntigravityConfig{}, RequestRetry: 1}))
 	result, errExecute := executor.ExecuteStream(ctx, &cliproxyauth.Auth{
 		Metadata: map[string]any{
 			"access_token": "token-123",
@@ -165,7 +165,7 @@ func TestAntigravityExecutorExecuteStreamInteractionsNoTerminalOnReadError(t *te
 	}))
 	defer server.Close()
 
-	executor := NewAntigravityExecutor(&config.Config{Antigravity: config.AntigravityConfig{}, RequestRetry: 1})
+	executor := NewAntigravityExecutor(antigravityNoControlPlane(&config.Config{Antigravity: config.AntigravityConfig{}, RequestRetry: 1}))
 	result, errExecute := executor.ExecuteStream(context.Background(), &cliproxyauth.Auth{
 		Metadata: map[string]any{
 			"access_token": "token-123",
@@ -221,7 +221,7 @@ func TestAntigravityExecutorExecuteStreamTranslatesInteractionsRequest(t *testin
 	}))
 	defer server.Close()
 
-	exec := NewAntigravityExecutor(&config.Config{RequestRetry: 1})
+	exec := NewAntigravityExecutor(antigravityNoControlPlane(&config.Config{RequestRetry: 1}))
 	auth := &cliproxyauth.Auth{
 		ID:       "interactions-antigravity-stream-auth",
 		Provider: "antigravity",

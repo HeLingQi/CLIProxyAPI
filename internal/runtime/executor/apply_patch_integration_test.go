@@ -95,7 +95,7 @@ func task6Executor(provider string) cliproxyauth.ProviderExecutor {
 	case "vertex":
 		return NewGeminiVertexExecutor(cfg)
 	case "antigravity":
-		return NewAntigravityExecutor(cfg)
+		return NewAntigravityExecutor(antigravityNoControlPlane(cfg))
 	default:
 		return NewOpenAICompatExecutor(provider, cfg)
 	}

@@ -37,8 +37,8 @@ func TestAntigravityDecoratorRunsAfterCredentialHTTP11PoolSelection(t *testing.T
 				return &auditTestTransport{RoundTripper: next}
 			})
 			auth := &coreauth.Auth{ID: "decorator-fixture", ProxyURL: proxy}
-			c := newAntigravityHTTPClient(ctx, &config.Config{}, auth, 0)
-			plain := newAntigravityHTTPClient(context.Background(), &config.Config{}, auth, 0)
+			c := newAntigravityHTTPClient(ctx, antigravityPinnedHTTP11(&config.Config{}), auth, 0)
+			plain := newAntigravityHTTPClient(context.Background(), antigravityPinnedHTTP11(&config.Config{}), auth, 0)
 			if calls != 1 {
 				t.Fatalf("decorator calls = %d, want 1", calls)
 			}

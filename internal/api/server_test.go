@@ -3059,6 +3059,8 @@ func TestUpdateClientsContext_AntigravityConnectionPoolPurgesTransports(t *testi
 			"expired":      time.Now().Add(time.Hour).Format(time.RFC3339),
 		},
 	}
+	// The CLI companion calls are outside what this test observes.
+	cfg1.Antigravity.DisableControlPlane = true
 	exec := executor.NewAntigravityExecutor(&cfg1)
 	req := httptest.NewRequest(http.MethodGet, srv.URL, nil)
 	_, _ = exec.HttpRequest(context.Background(), testAuth, req)

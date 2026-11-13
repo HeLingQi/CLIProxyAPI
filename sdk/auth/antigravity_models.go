@@ -41,6 +41,10 @@ type AntigravityModelCapabilityHints struct {
 	WebSearchModelIDs map[string]struct{}
 	// Nil means unknown; an empty non-nil set is an authoritative empty catalog.
 	ModelIDs map[string]struct{}
+	// ModelEnums maps a model ID to the internal model identifier the account catalog
+	// reports. The Antigravity CLI echoes it as the request_labels.model_enum field, so
+	// the proxy needs it to keep the agent request fingerprint identical.
+	ModelEnums map[string]string
 }
 
 // Clone returns a deep copy of the capability hints.
@@ -48,6 +52,7 @@ func (h AntigravityModelCapabilityHints) Clone() AntigravityModelCapabilityHints
 	return AntigravityModelCapabilityHints{
 		WebSearchModelIDs: maps.Clone(h.WebSearchModelIDs),
 		ModelIDs:          maps.Clone(h.ModelIDs),
+		ModelEnums:        maps.Clone(h.ModelEnums),
 	}
 }
 
@@ -187,6 +192,7 @@ func ParseAntigravityModelCapabilityHints(body []byte) (AntigravityModelCapabili
 		}
 	}
 
+	var modelEnums map[string]string
 	modelsResult := top.Get("models")
 	var modelIDs map[string]struct{}
 	if modelsResult.Exists() && modelsResult.Type != ojson.Null {
@@ -198,9 +204,21 @@ func ParseAntigravityModelCapabilityHints(body []byte) (AntigravityModelCapabili
 			return AntigravityModelCapabilityHints{}, false
 		}
 		modelIDs = make(map[string]struct{}, len(modelMap))
-		for id := range modelMap {
-			if normalized := NormalizeAntigravityModelID(id); normalized != "" {
-				modelIDs[normalized] = struct{}{}
+		for id, info := range modelMap {
+			normalized := NormalizeAntigravityModelID(id)
+			if normalized == "" {
+				continue
+			}
+			modelIDs[normalized] = struct{}{}
+			// The catalog names the model through its internal identifier; the CLI sends
+			// that value back as a request label on every agent request.
+			if info.Type == ojson.JSON {
+				if enum := info.Get("model").Str; strings.HasPrefix(enum, "MODEL_") {
+					if modelEnums == nil {
+						modelEnums = make(map[string]string, len(modelMap))
+					}
+					modelEnums[normalized] = enum
+				}
 			}
 		}
 	}
@@ -208,6 +226,7 @@ func ParseAntigravityModelCapabilityHints(body []byte) (AntigravityModelCapabili
 	return AntigravityModelCapabilityHints{
 		WebSearchModelIDs: webSearchModels,
 		ModelIDs:          modelIDs,
+		ModelEnums:        modelEnums,
 	}, true
 }
 
@@ -236,6 +255,9 @@ func BuildPersistedAntigravityCapabilityHints(project, endpoint string, hints An
 	}
 	if endpoint = sanitizeAntigravityPersistedEndpoint(endpoint); endpoint != "" {
 		value["endpoint"] = endpoint
+	}
+	if len(hints.ModelEnums) > 0 {
+		value["model_enums"] = maps.Clone(hints.ModelEnums)
 	}
 	if len(hints.WebSearchModelIDs) > 0 {
 		webSearchIDs := make([]string, 0, len(hints.WebSearchModelIDs))
@@ -293,10 +315,38 @@ func ParsePersistedAntigravityCapabilityHints(metadata map[string]any, expectedP
 		}
 		webSearchModels = parsedWebSearch
 	}
+	modelEnums, okEnums := parsePersistedAntigravityModelEnums(rawMap["model_enums"])
+	if !okEnums {
+		return AntigravityModelCapabilityHints{}, false
+	}
 	return AntigravityModelCapabilityHints{
 		ModelIDs:          modelIDs,
 		WebSearchModelIDs: webSearchModels,
+		ModelEnums:        modelEnums,
 	}, true
+}
+
+// parsePersistedAntigravityModelEnums validates the persisted model ID to internal
+// identifier map. A missing entry is a valid empty result because older auth files were
+// written before the label was captured.
+func parsePersistedAntigravityModelEnums(raw any) (map[string]string, bool) {
+	if raw == nil {
+		return nil, true
+	}
+	rawMap, okMap := raw.(map[string]any)
+	if !okMap || len(rawMap) > antigravityMaxCatalogModels {
+		return nil, false
+	}
+	enums := make(map[string]string, len(rawMap))
+	for id, value := range rawMap {
+		enum, okValue := value.(string)
+		normalized := NormalizeAntigravityModelID(id)
+		if !okValue || normalized == "" || !strings.HasPrefix(enum, "MODEL_") || len(enum) > antigravityMaxModelIDBytes {
+			return nil, false
+		}
+		enums[normalized] = enum
+	}
+	return enums, true
 }
 
 func parsePersistedAntigravityModelSet(raw any) (map[string]struct{}, bool) {

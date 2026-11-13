@@ -209,7 +209,7 @@ func TestIssue7000AntigravityExecutionAndFinalPayloadRules(t *testing.T) {
 						_ = payloadDoc.SetRawBytes("tools", []byte(`[{"type":"function","name":"lookup","parameters":{"type":"object","properties":{"q":{"type":"string"}},"required":["q"]}}]`))
 					}
 					payload := payloadDoc.Bytes()
-					exec := NewAntigravityExecutor(cfg)
+					exec := NewAntigravityExecutor(antigravityNoControlPlane(cfg))
 					auth := &cliproxyauth.Auth{ID: t.Name(), Provider: "antigravity", Attributes: map[string]string{"base_url": server.URL}, Metadata: map[string]any{"access_token": "token", "project_id": "project-test", "expired": time.Now().Add(time.Hour).Format(time.RFC3339)}}
 					req := cliproxyexecutor.Request{Model: model, Payload: payload}
 					opts := cliproxyexecutor.Options{SourceFormat: format}

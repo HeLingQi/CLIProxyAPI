@@ -230,9 +230,9 @@ func TestAntigravityGeminiSignatureNormalizationDoesNotRepeatLogs(t *testing.T) 
 }
 
 func TestAntigravitySensitiveWordsObfuscatesSystemInstructionOnly(t *testing.T) {
-	executor := NewAntigravityExecutor(&config.Config{
+	executor := NewAntigravityExecutor(antigravityNoControlPlane(&config.Config{
 		Antigravity: config.AntigravityConfig{SensitiveWords: []string{"proxy"}},
-	})
+	}))
 	payload := []byte(`{"request":{"systemInstruction":{"parts":[{"text":"Use proxy safely"}]},"contents":[{"role":"user","parts":[{"text":"proxy remains unchanged"}]}]}}`)
 
 	got := executor.obfuscateSensitiveWords(payload)
@@ -258,10 +258,10 @@ func TestAntigravityStreamObfuscatesSensitiveSystemInstruction(t *testing.T) {
 	}))
 	defer server.Close()
 
-	executor := NewAntigravityExecutor(&config.Config{
+	executor := NewAntigravityExecutor(antigravityNoControlPlane(&config.Config{
 		Antigravity:  config.AntigravityConfig{SensitiveWords: []string{"Hermes", "Nous Research"}},
 		RequestRetry: 1,
-	})
+	}))
 	result, errExecute := executor.ExecuteStream(context.Background(), &cliproxyauth.Auth{
 		Metadata: map[string]any{
 			"access_token": "token-123",
@@ -308,10 +308,10 @@ func TestAntigravityExecuteObfuscatesCodexIdentityWithCGJ(t *testing.T) {
 	}))
 	defer server.Close()
 
-	executor := NewAntigravityExecutor(&config.Config{
+	executor := NewAntigravityExecutor(antigravityNoControlPlane(&config.Config{
 		Antigravity:  config.AntigravityConfig{SensitiveWords: []string{"codex", "GPT-5"}},
 		RequestRetry: 1,
-	})
+	}))
 	auth := &cliproxyauth.Auth{
 		Metadata: map[string]any{
 			"access_token": "token-123",
@@ -373,7 +373,7 @@ func TestAntigravitySensitiveWordsReplaceFromYAML(t *testing.T) {
 	if errParse != nil {
 		t.Fatalf("ParseConfigBytes() error = %v", errParse)
 	}
-	executor := NewAntigravityExecutor(cfg)
+	executor := NewAntigravityExecutor(antigravityNoControlPlane(cfg))
 	payload := []byte(`{"request":{"systemInstruction":{"parts":[{"text":"You are Codex, an agent based on GPT-5. Avoid mentioning Codex."}]},"contents":[{"role":"user","parts":[{"text":"You are Codex, an agent based on GPT-5."}]}]}}`)
 
 	got := executor.obfuscateSensitiveWords(payload)
@@ -414,7 +414,7 @@ func TestAntigravitySensitiveWordsReplaceOnlyPreservesToolsAndCountTokens(t *tes
 		},
 		RequestRetry: 1,
 	}
-	executor := NewAntigravityExecutor(cfg)
+	executor := NewAntigravityExecutor(antigravityNoControlPlane(cfg))
 	m1 := executor.getSensitiveWordMatcher()
 	m2 := executor.getSensitiveWordMatcher()
 	if m1 == nil || m1 != m2 {
@@ -482,10 +482,10 @@ func TestAntigravityStreamDoesNotEmitSyntheticTerminalOnReadError(t *testing.T) 
 	}))
 	defer server.Close()
 
-	executor := NewAntigravityExecutor(&config.Config{
+	executor := NewAntigravityExecutor(antigravityNoControlPlane(&config.Config{
 		Antigravity:  config.AntigravityConfig{},
 		RequestRetry: 1,
-	})
+	}))
 	result, errExecute := executor.ExecuteStream(context.Background(), &cliproxyauth.Auth{
 		Metadata: map[string]any{
 			"access_token": "token-123",
@@ -595,7 +595,7 @@ func TestAntigravityStreamPrependsLeadingUserForGemini(t *testing.T) {
 			}))
 			defer server.Close()
 
-			executor := NewAntigravityExecutor(&config.Config{RequestRetry: 1})
+			executor := NewAntigravityExecutor(antigravityNoControlPlane(&config.Config{RequestRetry: 1}))
 			auth := testAntigravityAuth(server.URL)
 			auth.Metadata["project_id"] = "project-1"
 			result, errExecute := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
@@ -633,7 +633,7 @@ func TestAntigravityStreamPrependsLeadingUserForIssue4959ResponsesHistory(t *tes
 	}))
 	defer server.Close()
 
-	executor := NewAntigravityExecutor(&config.Config{RequestRetry: 1})
+	executor := NewAntigravityExecutor(antigravityNoControlPlane(&config.Config{RequestRetry: 1}))
 	auth := testAntigravityAuth(server.URL)
 	auth.Metadata["project_id"] = "project-1"
 	result, errExecute := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
@@ -689,7 +689,7 @@ func TestAntigravityStreamAppendsTrailingUserForGeminiTrailingModelTurn(t *testi
 	}))
 	defer server.Close()
 
-	executor := NewAntigravityExecutor(&config.Config{RequestRetry: 1})
+	executor := NewAntigravityExecutor(antigravityNoControlPlane(&config.Config{RequestRetry: 1}))
 	auth := testAntigravityAuth(server.URL)
 	auth.Metadata["project_id"] = "project-1"
 	result, errExecute := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
@@ -745,7 +745,7 @@ func issue6524CaptureStreamContents(t *testing.T, payload []byte) []ojson.Result
 	}))
 	defer server.Close()
 
-	executor := NewAntigravityExecutor(&config.Config{RequestRetry: 1})
+	executor := NewAntigravityExecutor(antigravityNoControlPlane(&config.Config{RequestRetry: 1}))
 	auth := testAntigravityAuth(server.URL)
 	auth.Metadata["project_id"] = "project-1"
 	result, errExecute := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
@@ -824,7 +824,7 @@ func TestAntigravityStreamPrependsLeadingUserAfterReplayInsertsFunctionCall(t *t
 	defer server.Close()
 
 	payload := []byte(`{"model":"gemini-3.6-flash-high","session_id":"` + sessionID + `","messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"` + clientID + `","content":"ok"}]}],"tools":[{"name":"run","input_schema":{"type":"object"}}]}`)
-	executor := NewAntigravityExecutor(&config.Config{RequestRetry: 1})
+	executor := NewAntigravityExecutor(antigravityNoControlPlane(&config.Config{RequestRetry: 1}))
 	auth := testAntigravityAuth(server.URL)
 	auth.Metadata["project_id"] = "project-1"
 	result, errExecute := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
@@ -901,7 +901,7 @@ func TestAntigravityStreamDoesNotPrependLeadingUserForClaudeTarget(t *testing.T)
 			}))
 			defer server.Close()
 
-			executor := NewAntigravityExecutor(&config.Config{RequestRetry: 1})
+			executor := NewAntigravityExecutor(antigravityNoControlPlane(&config.Config{RequestRetry: 1}))
 			auth := testAntigravityAuth(server.URL)
 			auth.Metadata["project_id"] = "project-1"
 			result, errExecute := executor.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
@@ -986,7 +986,7 @@ func TestAntigravityRequestPathsDoNotFallbackEndpoints(t *testing.T) {
 					SourceFormat:   sdktranslator.FormatGemini,
 					ResponseFormat: sdktranslator.FormatGemini,
 				}
-				executor := NewAntigravityExecutor(&config.Config{})
+				executor := NewAntigravityExecutor(antigravityNoControlPlane(&config.Config{}))
 
 				var errRequest error
 				switch route.kind {
@@ -1053,7 +1053,7 @@ func TestAntigravityCountTokensMatchesTargetLeadingUserPolicy(t *testing.T) {
 			}))
 			defer server.Close()
 
-			executor := NewAntigravityExecutor(&config.Config{RequestRetry: 1})
+			executor := NewAntigravityExecutor(antigravityNoControlPlane(&config.Config{RequestRetry: 1}))
 			payload := []byte(`{"contents":[` +
 				`{"role":"model","parts":[{"text":"prior output"}]},` +
 				`{"role":"user","parts":[{"text":"continue"}]}` +
@@ -1110,7 +1110,7 @@ func TestAntigravityExecutorCountTokensSanitizesGeminiToolHistory(t *testing.T) 
 	defer server.Close()
 
 	payload := []byte(`{"model":"gemini-3.6-flash-high","messages":[{"role":"assistant","content":[{"type":"tool_use","id":"call-1","name":"read","input":{"file":"one"},"signature":"` + nativeSignature + `"},{"type":"tool_use","id":"call-2","name":"read","input":{"file":"two"},"signature":"skip_thought_signature_validator"}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call-2","content":"two"},{"type":"tool_result","tool_use_id":"call-1","content":"one"}]}]}`)
-	exec := NewAntigravityExecutor(&config.Config{RequestRetry: 1})
+	exec := NewAntigravityExecutor(antigravityNoControlPlane(&config.Config{RequestRetry: 1}))
 	_, errCount := exec.CountTokens(context.Background(), testAntigravityAuth(server.URL), cliproxyexecutor.Request{
 		Model:   "gemini-3.6-flash-high",
 		Payload: payload,
@@ -1172,7 +1172,7 @@ func TestAntigravityExecutorCountTokensReconstructsCompactedClaudeToolCall(t *te
 	defer server.Close()
 
 	payload := []byte(`{"model":"gemini-3.6-flash-high","session_id":"count-token-replay","messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"` + clientID + `","content":"ok"}]}],"tools":[{"name":"Bash","input_schema":{"type":"object","properties":{"command":{"type":"string"}}}}]}`)
-	exec := NewAntigravityExecutor(&config.Config{RequestRetry: 1})
+	exec := NewAntigravityExecutor(antigravityNoControlPlane(&config.Config{RequestRetry: 1}))
 	_, errCount := exec.CountTokens(context.Background(), testAntigravityAuth(server.URL), cliproxyexecutor.Request{
 		Model:   "gemini-3.6-flash-high",
 		Payload: payload,
@@ -1475,7 +1475,7 @@ func TestAntigravityExecutorCountTokensStripsStatefulFields(t *testing.T) {
 	defer server.Close()
 
 	payload := []byte(`{"contents":[{"role":"user","parts":[{"text":"hello"}]}],"toolConfig":{"functionCallingConfig":{"mode":"AUTO"}},"labels":{"source":"ide"},"sessionId":"session-123"}`)
-	exec := NewAntigravityExecutor(&config.Config{RequestRetry: 1})
+	exec := NewAntigravityExecutor(antigravityNoControlPlane(&config.Config{RequestRetry: 1}))
 	_, errCount := exec.CountTokens(context.Background(), testAntigravityAuth(server.URL), cliproxyexecutor.Request{
 		Model:   "gemini-3.6-flash-high",
 		Payload: payload,

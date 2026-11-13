@@ -269,7 +269,7 @@ func TestAntigravityExecute_DoesNotUseRequestRetryForInternalRetries(t *testing.
 	}))
 	defer server.Close()
 
-	exec := NewAntigravityExecutor(&config.Config{RequestRetry: 3})
+	exec := NewAntigravityExecutor(antigravityNoControlPlane(&config.Config{RequestRetry: 3}))
 	auth := &cliproxyauth.Auth{
 		ID: "auth-transient-429",
 		Attributes: map[string]string{
@@ -322,9 +322,9 @@ func TestAntigravityExecute_CreditsInjectedWhenConductorRequests(t *testing.T) {
 	}))
 	defer server.Close()
 
-	exec := NewAntigravityExecutor(&config.Config{
+	exec := NewAntigravityExecutor(antigravityNoControlPlane(&config.Config{
 		QuotaExceeded: config.QuotaExceeded{AntigravityCredits: true},
-	})
+	}))
 	auth := &cliproxyauth.Auth{
 		ID: fmt.Sprintf("auth-credits-conductor-%d", time.Now().UnixNano()),
 		Attributes: map[string]string{
@@ -385,9 +385,9 @@ func TestAntigravityExecute_NoCreditsWithoutConductorFlag(t *testing.T) {
 	}))
 	defer server.Close()
 
-	exec := NewAntigravityExecutor(&config.Config{
+	exec := NewAntigravityExecutor(antigravityNoControlPlane(&config.Config{
 		QuotaExceeded: config.QuotaExceeded{AntigravityCredits: true},
-	})
+	}))
 	auth := &cliproxyauth.Auth{
 		ID: "auth-no-conductor-flag",
 		Attributes: map[string]string{
@@ -591,9 +591,9 @@ func TestMaybeRefreshAntigravityCreditsHintHomeRefreshThrottleUsesSetNX(t *testi
 	client := newFakeAntigravityKVClient()
 	client.setNXResult = false
 	useFakeAntigravityKVClient(t, client, true, nil)
-	exec := NewAntigravityExecutor(&config.Config{
+	exec := NewAntigravityExecutor(antigravityNoControlPlane(&config.Config{
 		QuotaExceeded: config.QuotaExceeded{AntigravityCredits: true},
-	})
+	}))
 	auth := &cliproxyauth.Auth{ID: "home-refresh-throttle-auth"}
 	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", roundTripperFunc(func(req *http.Request) (*http.Response, error) {
 		t.Fatalf("refresh request should not run when Home KV throttle lock is not acquired")
@@ -617,9 +617,9 @@ func TestEnsureAccessToken_WarmTokenLoadsCreditsHint(t *testing.T) {
 	resetAntigravityCreditsRetryState()
 	t.Cleanup(resetAntigravityCreditsRetryState)
 
-	exec := NewAntigravityExecutor(&config.Config{
+	exec := NewAntigravityExecutor(antigravityNoControlPlane(&config.Config{
 		QuotaExceeded: config.QuotaExceeded{AntigravityCredits: true},
-	})
+	}))
 	auth := &cliproxyauth.Auth{
 		ID: fmt.Sprintf("auth-warm-token-credits-%d", time.Now().UnixNano()),
 		Metadata: map[string]any{
@@ -676,9 +676,9 @@ func TestMaybeRefreshAntigravityCreditsHint_RefreshesExpiredHintAndRecoversCredi
 	resetAntigravityCreditsRetryState()
 	t.Cleanup(resetAntigravityCreditsRetryState)
 
-	exec := NewAntigravityExecutor(&config.Config{
+	exec := NewAntigravityExecutor(antigravityNoControlPlane(&config.Config{
 		QuotaExceeded: config.QuotaExceeded{AntigravityCredits: true},
-	})
+	}))
 	auth := &cliproxyauth.Auth{
 		ID: fmt.Sprintf("auth-expired-credits-hint-%d", time.Now().UnixNano()),
 		Metadata: map[string]any{
@@ -819,7 +819,7 @@ func TestAntigravityManagerExecuteAndStream_ToppedUpCreditsRecoverDuringQuotaCoo
 			cfg := &config.Config{
 				QuotaExceeded: config.QuotaExceeded{AntigravityCredits: true},
 			}
-			exec := NewAntigravityExecutor(cfg)
+			exec := NewAntigravityExecutor(antigravityNoControlPlane(cfg))
 			manager := cliproxyauth.NewManager(nil, nil, nil)
 			manager.SetConfig(cfg)
 			manager.RegisterExecutor(exec)
@@ -952,7 +952,7 @@ func TestUpdateAntigravityCreditsBalance_LoadCodeAssistUserAgent(t *testing.T) {
 	resetAntigravityCreditsRetryState()
 	t.Cleanup(resetAntigravityCreditsRetryState)
 
-	exec := NewAntigravityExecutor(&config.Config{})
+	exec := NewAntigravityExecutor(antigravityNoControlPlane(&config.Config{}))
 	const configuredUserAgent = "antigravity/hub/1.23.2 windows/amd64 google-api-nodejs-client/10.3.0"
 	const loadCodeAssistUserAgent = "antigravity/hub/1.23.2 windows/amd64"
 	auth := &cliproxyauth.Auth{

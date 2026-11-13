@@ -1117,6 +1117,13 @@ oauth:
       #   enabled: false             # whether to enable connection pooling (default: false)
       #   idle-conn-timeout: "30s"    # idle keep-alive timeout (default: 30s, capped at 210s)
       #   max-idle-conns-per-host: 2  # max idle connections per host per credential (default: 2)
+      # Upstream protocol and CLI companion calls. Antigravity requests look like the Antigravity
+      # CLI by default: HTTP/2 over ALPN, plus the companion calls the CLI performs around every
+      # generation (loadCodeAssist, fetchAdminControls, retrieveUserQuotaSummary, fetchUserInfo,
+      # listExperiments, writeTrajectoryAcls and recordTrajectoryAnalytics, throttled per
+      # credential). Set these to true to opt out of each behavior.
+      # disable-http2: false          # pin upstream requests to HTTP/1.1
+      # disable-control-plane: false  # skip the CLI companion calls and the trajectory report
       # Use credits as a last resort after free-tier Claude quota is exhausted.
       antigravity-credits: true
 

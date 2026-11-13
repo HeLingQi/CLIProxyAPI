@@ -37,10 +37,10 @@ func TestAntigravityCompactionTriggerStreamGemini(t *testing.T) {
 	}))
 	defer server.Close()
 
-	executor := NewAntigravityExecutor(&config.Config{
+	executor := NewAntigravityExecutor(antigravityNoControlPlane(&config.Config{
 		Antigravity:  config.AntigravityConfig{},
 		RequestRetry: 1,
-	})
+	}))
 	auth := &cliproxyauth.Auth{
 		ID:       "antigravity-auth-test",
 		Provider: "antigravity",
@@ -116,10 +116,10 @@ func TestAntigravityCompactionTriggerStreamClaude(t *testing.T) {
 	}))
 	defer server.Close()
 
-	executor := NewAntigravityExecutor(&config.Config{
+	executor := NewAntigravityExecutor(antigravityNoControlPlane(&config.Config{
 		Antigravity:  config.AntigravityConfig{},
 		RequestRetry: 1,
-	})
+	}))
 	auth := &cliproxyauth.Auth{
 		ID:       "antigravity-auth-test",
 		Provider: "antigravity",
@@ -190,10 +190,10 @@ func TestAntigravityCompactionAltResponsesCompact(t *testing.T) {
 	}))
 	defer server.Close()
 
-	executor := NewAntigravityExecutor(&config.Config{
+	executor := NewAntigravityExecutor(antigravityNoControlPlane(&config.Config{
 		Antigravity:  config.AntigravityConfig{},
 		RequestRetry: 1,
-	})
+	}))
 	auth := &cliproxyauth.Auth{
 		ID:       "antigravity-auth-test",
 		Provider: "antigravity",
@@ -251,10 +251,10 @@ func TestAntigravityCompactionReplayNextTurn(t *testing.T) {
 	}))
 	defer server.Close()
 
-	executor := NewAntigravityExecutor(&config.Config{
+	executor := NewAntigravityExecutor(antigravityNoControlPlane(&config.Config{
 		Antigravity:  config.AntigravityConfig{},
 		RequestRetry: 1,
-	})
+	}))
 	auth := &cliproxyauth.Auth{
 		ID:       "antigravity-auth-test",
 		Provider: "antigravity",
@@ -371,10 +371,10 @@ func TestAntigravityCompactionSequentialCompactionPreservesContext(t *testing.T)
 	}))
 	defer server.Close()
 
-	executor := NewAntigravityExecutor(&config.Config{
+	executor := NewAntigravityExecutor(antigravityNoControlPlane(&config.Config{
 		Antigravity:  config.AntigravityConfig{},
 		RequestRetry: 1,
-	})
+	}))
 	auth := &cliproxyauth.Auth{
 		ID:       "antigravity-auth-test",
 		Provider: "antigravity",

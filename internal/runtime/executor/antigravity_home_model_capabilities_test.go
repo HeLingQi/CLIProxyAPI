@@ -73,7 +73,7 @@ func TestAntigravityHomeModelThinkingLevelRemainsLevel(t *testing.T) {
 	cfg.Home.Enabled = true
 	manager := cliproxyauth.NewManager(nil, nil, nil)
 	manager.SetConfig(cfg)
-	manager.RegisterExecutor(NewAntigravityExecutor(cfg))
+	manager.RegisterExecutor(NewAntigravityExecutor(antigravityNoControlPlane(cfg)))
 	manager.PublishHomeDispatch(&antigravityHomeModelCapabilityDispatcher{baseURL: server.URL}, executionregistry.New(), 1)
 
 	payload := []byte(`{"model":"gemini-3.8-flash-high","reasoning_effort":"medium","messages":[{"role":"user","content":"hello"}]}`)

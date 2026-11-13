@@ -12,7 +12,7 @@ func TestApplyPatchActualExecutors(t *testing.T) {
 	for _, exec := range []coreauth.ProviderExecutor{
 		NewOpenAICompatExecutor("arbitrary-plugin-provider", cfg), NewClaudeExecutor(cfg),
 		NewGeminiExecutor(cfg), NewGeminiInteractionsExecutor(cfg), NewGeminiVertexExecutor(cfg),
-		NewAntigravityExecutor(cfg), NewAIStudioExecutor(cfg, "aistudio", nil),
+		NewAntigravityExecutor(antigravityNoControlPlane(cfg)), NewAIStudioExecutor(cfg, "aistudio", nil),
 		NewCodexExecutor(cfg), NewCodexWebsocketsExecutor(cfg), NewCodexAutoExecutor(cfg),
 	} {
 		support, okSupport := exec.(coreauth.ApplyPatchSupport)

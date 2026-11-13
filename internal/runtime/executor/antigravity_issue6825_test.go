@@ -95,7 +95,7 @@ func newIssue6825Conversation(t *testing.T, responses ...string) *issue6825Conve
 	auth := testAntigravityAuth(server.URL)
 	auth.ID = "issue-6825-" + t.Name()
 	auth.Metadata["project_id"] = "test-project"
-	return &issue6825Conversation{t: t, executor: NewAntigravityExecutor(&config.Config{}), auth: auth, requests: requests}
+	return &issue6825Conversation{t: t, executor: NewAntigravityExecutor(antigravityNoControlPlane(&config.Config{})), auth: auth, requests: requests}
 }
 
 func issue6825ToolResponse(signature, prefix string) string {

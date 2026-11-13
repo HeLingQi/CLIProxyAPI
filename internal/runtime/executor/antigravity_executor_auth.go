@@ -77,6 +77,7 @@ func (e *AntigravityExecutor) ensureAccessToken(ctx context.Context, auth *clipr
 	expiry, _ := auth.ExpirationTime()
 	if accessToken != "" && expiry.After(time.Now().Add(antigravityRequestTokenSafetyWindow)) {
 		e.maybeRefreshAntigravityCreditsHint(ctx, auth, accessToken)
+		e.maybeRefreshAntigravityControlPlane(ctx, auth, accessToken)
 		return accessToken, nil, nil
 	}
 	refreshCtx := context.Background()
@@ -94,6 +95,7 @@ func (e *AntigravityExecutor) ensureAccessToken(ctx context.Context, auth *clipr
 			return "", nil, statusErr{code: http.StatusUnauthorized, msg: "missing access token"}
 		}
 		e.maybeRefreshAntigravityCreditsHint(ctx, refreshed, token)
+		e.maybeRefreshAntigravityControlPlane(ctx, refreshed, token)
 		return token, refreshed, nil
 	}
 

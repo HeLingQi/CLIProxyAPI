@@ -254,6 +254,15 @@ type AntigravityConfig struct {
 
 	// ConnectionPool configures upstream HTTP connection pooling behavior for Antigravity.
 	ConnectionPool AntigravityConnectionPoolConfig `yaml:"connection-pool,omitempty" json:"connection-pool,omitempty"`
+
+	// DisableHTTP2 pins upstream Antigravity requests to HTTP/1.1 instead of negotiating
+	// HTTP/2 over ALPN, which is what the Antigravity CLI does.
+	DisableHTTP2 bool `yaml:"disable-http2,omitempty" json:"disable-http2,omitempty"`
+
+	// DisableControlPlane stops mirroring the companion calls the Antigravity CLI performs
+	// around every generation: fetchUserInfo, listExperiments, fetchAdminControls,
+	// retrieveUserQuotaSummary, writeTrajectoryAcls and recordTrajectoryAnalytics.
+	DisableControlPlane bool `yaml:"disable-control-plane,omitempty" json:"disable-control-plane,omitempty"`
 }
 
 // AntigravityConnectionPoolConfig controls upstream HTTP/1.1 connection pooling behavior for Antigravity.

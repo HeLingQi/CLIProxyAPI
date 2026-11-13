@@ -59,10 +59,10 @@ func TestAntigravityStreamFinalizesSplitTerminalUsageOnce(t *testing.T) {
 	}))
 	defer server.Close()
 
-	executor := NewAntigravityExecutor(&config.Config{
+	executor := NewAntigravityExecutor(antigravityNoControlPlane(&config.Config{
 		Antigravity:  config.AntigravityConfig{},
 		RequestRetry: 1,
-	})
+	}))
 	result, errExecute := executor.ExecuteStream(context.Background(), &cliproxyauth.Auth{
 		Metadata: map[string]any{
 			"access_token": "token-123",
@@ -136,10 +136,10 @@ func TestAntigravityStreamReportsSplitTerminalUsage(t *testing.T) {
 	}))
 	defer server.Close()
 
-	executor := NewAntigravityExecutor(&config.Config{
+	executor := NewAntigravityExecutor(antigravityNoControlPlane(&config.Config{
 		Antigravity:  config.AntigravityConfig{},
 		RequestRetry: 1,
-	})
+	}))
 	result, errExecute := executor.ExecuteStream(context.Background(), &cliproxyauth.Auth{
 		ID: authID,
 		Metadata: map[string]any{

@@ -64,14 +64,14 @@ func TestAntigravityExecuteStreamReusesUpstreamConnection(t *testing.T) {
 	defer server.Close()
 
 	enabledPool := true
-	exec := NewAntigravityExecutor(&config.Config{
+	exec := NewAntigravityExecutor(antigravityNoControlPlane(&config.Config{
 		RequestRetry: 1,
 		Antigravity: config.AntigravityConfig{
 			ConnectionPool: config.AntigravityConnectionPoolConfig{
 				Enabled: &enabledPool,
 			},
 		},
-	})
+	}))
 	auth := &cliproxyauth.Auth{
 		ID:         "antigravity-keepalive-auth",
 		Provider:   "antigravity",
@@ -144,14 +144,14 @@ func TestAntigravityCountTokensReusesUpstreamConnection(t *testing.T) {
 	defer server.Close()
 
 	enabledCountPool := true
-	exec := NewAntigravityExecutor(&config.Config{
+	exec := NewAntigravityExecutor(antigravityNoControlPlane(&config.Config{
 		RequestRetry: 1,
 		Antigravity: config.AntigravityConfig{
 			ConnectionPool: config.AntigravityConnectionPoolConfig{
 				Enabled: &enabledCountPool,
 			},
 		},
-	})
+	}))
 	auth := &cliproxyauth.Auth{
 		ID:         "antigravity-counttokens-auth",
 		Provider:   "antigravity",
@@ -215,13 +215,13 @@ func TestAntigravityHTTPRequestReusesUpstreamConnection(t *testing.T) {
 	defer server.Close()
 
 	enabledHTTPPool := true
-	exec := NewAntigravityExecutor(&config.Config{
+	exec := NewAntigravityExecutor(antigravityNoControlPlane(&config.Config{
 		Antigravity: config.AntigravityConfig{
 			ConnectionPool: config.AntigravityConnectionPoolConfig{
 				Enabled: &enabledHTTPPool,
 			},
 		},
-	})
+	}))
 	auth := &cliproxyauth.Auth{
 		ID:       "antigravity-http-request-auth",
 		Provider: "antigravity",
@@ -300,7 +300,7 @@ func TestAntigravityHTTPRequestConcurrentSessionsStayIsolated(t *testing.T) {
 	}))
 	defer server.Close()
 
-	exec := NewAntigravityExecutor(&config.Config{})
+	exec := NewAntigravityExecutor(antigravityNoControlPlane(&config.Config{}))
 	auth := &cliproxyauth.Auth{
 		ID:       "antigravity-concurrent-sessions-auth",
 		Provider: "antigravity",
@@ -384,7 +384,7 @@ func TestAntigravityDefaultConfigDisablesPoolingAndClosesConnections(t *testing.
 	defer server.Close()
 
 	// Default config has ConnectionPool.Enabled = nil, which defaults to false (disabled)
-	exec := NewAntigravityExecutor(&config.Config{})
+	exec := NewAntigravityExecutor(antigravityNoControlPlane(&config.Config{}))
 	auth := &cliproxyauth.Auth{
 		ID:       "antigravity-default-short-auth",
 		Provider: "antigravity",

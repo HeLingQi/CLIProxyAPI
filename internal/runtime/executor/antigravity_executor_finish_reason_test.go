@@ -35,10 +35,10 @@ func newAntigravityNoFinishReasonServer(t *testing.T) *httptest.Server {
 
 func collectAntigravityStream(t *testing.T, baseURL string, sourceFormat, responseFormat sdktranslator.Format, payload string) [][]byte {
 	t.Helper()
-	executor := NewAntigravityExecutor(&config.Config{
+	executor := NewAntigravityExecutor(antigravityNoControlPlane(&config.Config{
 		Antigravity:  config.AntigravityConfig{},
 		RequestRetry: 1,
-	})
+	}))
 	result, errExecute := executor.ExecuteStream(context.Background(), &cliproxyauth.Auth{
 		Metadata: map[string]any{
 			"access_token": "token-123",
@@ -88,10 +88,10 @@ func TestAntigravityStreamSurfacesTrailingBackendError(t *testing.T) {
 
 	for _, format := range []sdktranslator.Format{sdktranslator.FormatClaude, sdktranslator.FormatOpenAI} {
 		t.Run(format.String(), func(t *testing.T) {
-			executor := NewAntigravityExecutor(&config.Config{
+			executor := NewAntigravityExecutor(antigravityNoControlPlane(&config.Config{
 				Antigravity:  config.AntigravityConfig{},
 				RequestRetry: 1,
-			})
+			}))
 			result, errExecute := executor.ExecuteStream(context.Background(), &cliproxyauth.Auth{
 				Metadata: map[string]any{
 					"access_token": "token-123",
@@ -157,10 +157,10 @@ func TestAntigravityStreamDoesNotEmitClaudeMessageStopOnReadError(t *testing.T) 
 	}))
 	defer server.Close()
 
-	executor := NewAntigravityExecutor(&config.Config{
+	executor := NewAntigravityExecutor(antigravityNoControlPlane(&config.Config{
 		Antigravity:  config.AntigravityConfig{},
 		RequestRetry: 1,
-	})
+	}))
 	result, errExecute := executor.ExecuteStream(context.Background(), &cliproxyauth.Auth{
 		Metadata: map[string]any{
 			"access_token": "token-123",
@@ -217,10 +217,10 @@ func TestAntigravityStreamDoesNotFinalizeEmptyUpstreamStream(t *testing.T) {
 			`{"model":"gemini-3.7-flash","messages":[{"role":"user","content":"hello"}],"stream":true}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			executor := NewAntigravityExecutor(&config.Config{
+			executor := NewAntigravityExecutor(antigravityNoControlPlane(&config.Config{
 				Antigravity:  config.AntigravityConfig{},
 				RequestRetry: 1,
-			})
+			}))
 			result, errExecute := executor.ExecuteStream(context.Background(), &cliproxyauth.Auth{
 				Metadata: map[string]any{
 					"access_token": "token-123",

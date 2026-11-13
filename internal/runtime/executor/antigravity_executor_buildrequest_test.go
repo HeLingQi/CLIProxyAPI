@@ -38,6 +38,34 @@ func TestResolveAntigravityRequestBaseURL(t *testing.T) {
 	})
 }
 
+// The backend gates model visibility and feature flags on the client fingerprint, so the
+// upstream request must carry the Antigravity CLI User-Agent and only the headers the CLI
+// itself sends.
+func TestAntigravityBuildRequestHeadersMatchCLI(t *testing.T) {
+	t.Parallel()
+
+	executor := &AntigravityExecutor{}
+	auth := &cliproxyauth.Auth{Metadata: map[string]any{"project_id": "project-1"}}
+	req, errBuild := executor.buildRequest(context.Background(), auth, "token", "gemini-3.1-pro", []byte(`{"request":{"contents":[]}}`), true, "", antigravityBaseURLDaily)
+	if errBuild != nil {
+		t.Fatalf("buildRequest error: %v", errBuild)
+	}
+	if got := req.Header.Get("User-Agent"); !strings.HasPrefix(got, "antigravity/cli/") {
+		t.Fatalf("User-Agent = %q, want the Antigravity CLI family", got)
+	}
+	if got := req.Header.Get("Authorization"); got != "Bearer token" {
+		t.Fatalf("Authorization = %q", got)
+	}
+	if got := req.Header.Get("Content-Type"); got != "application/json" {
+		t.Fatalf("Content-Type = %q", got)
+	}
+	for _, name := range []string{"Accept", "X-Goog-Api-Client", "X-Goog-User-Project"} {
+		if got := req.Header.Get(name); got != "" {
+			t.Fatalf("%s = %q, want omitted", name, got)
+		}
+	}
+}
+
 func TestAntigravityLoadCodeAssistBaseURL(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -390,7 +418,7 @@ func TestAntigravityExecutor_Claude55ExplicitThinkingLevelPreserved(t *testing.T
 						}, nil
 					}))
 
-					executor := NewAntigravityExecutor(&config.Config{})
+					executor := NewAntigravityExecutor(antigravityNoControlPlane(&config.Config{}))
 					auth := &cliproxyauth.Auth{
 						ID:       "ag-claude-55-test",
 						Provider: "antigravity",

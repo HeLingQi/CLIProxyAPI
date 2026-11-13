@@ -57,7 +57,7 @@ func TestAntigravityExecutorCAQSTwoTurnReplay(t *testing.T) {
 						}
 					}))
 					defer server.Close()
-					executor := NewAntigravityExecutor(&config.Config{})
+					executor := NewAntigravityExecutor(antigravityNoControlPlane(&config.Config{}))
 					auth := &cliproxyauth.Auth{ID: "caqs-replay-" + t.Name(), Metadata: map[string]any{"access_token": "test-token", "expired": time.Now().Add(time.Hour).Format(time.RFC3339), "project_id": "test-project"}, Attributes: map[string]string{"base_url": server.URL}}
 					opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude, ResponseFormat: sdktranslator.FormatClaude, Stream: streaming}
 					call := func(payload []byte) []byte {

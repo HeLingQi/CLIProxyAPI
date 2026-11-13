@@ -31,7 +31,7 @@ func TestAntigravityDisableCooling_ShortCooldownBypassedInHomeMode(t *testing.T)
 			Enabled: true,
 		},
 	}
-	exec := NewAntigravityExecutor(cfg)
+	exec := NewAntigravityExecutor(antigravityNoControlPlane(cfg))
 	auth := &cliproxyauth.Auth{
 		ID: "home-cooling-disabled-auth",
 		Metadata: map[string]any{
@@ -103,7 +103,7 @@ func TestAntigravityDisableCooling_ExecuteStreamBypassesShortCooldown(t *testing
 			Enabled: true,
 		},
 	}
-	exec := NewAntigravityExecutor(cfg)
+	exec := NewAntigravityExecutor(antigravityNoControlPlane(cfg))
 	auth := &cliproxyauth.Auth{
 		ID: "home-cooling-disabled-auth-stream",
 		Metadata: map[string]any{
@@ -148,7 +148,7 @@ func TestAntigravityDisableCooling_AuthOverrideBypassesShortCooldown(t *testing.
 	cfg := &config.Config{
 		DisableCooling: false,
 	}
-	exec := NewAntigravityExecutor(cfg)
+	exec := NewAntigravityExecutor(antigravityNoControlPlane(cfg))
 	auth := &cliproxyauth.Auth{
 		ID: "override-cooling-disabled-auth",
 		Metadata: map[string]any{
@@ -223,7 +223,7 @@ func TestAntigravityDisableCooling_CreditsHintRefreshBypassedInHomeMode(t *testi
 			AntigravityCredits: true,
 		},
 	}
-	exec := NewAntigravityExecutor(cfg)
+	exec := NewAntigravityExecutor(antigravityNoControlPlane(cfg))
 	auth := &cliproxyauth.Auth{
 		ID: "home-refresh-cooling-disabled-auth",
 		Metadata: map[string]any{

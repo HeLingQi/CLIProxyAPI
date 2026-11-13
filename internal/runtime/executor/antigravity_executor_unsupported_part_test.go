@@ -58,7 +58,7 @@ func TestAntigravityExecutorRefusesAFileOnlyTurnBeforeCallingUpstream(t *testing
 			},
 			Attributes: map[string]string{"base_url": server.URL},
 		}
-		exec := NewAntigravityExecutor(&config.Config{})
+		exec := NewAntigravityExecutor(antigravityNoControlPlane(&config.Config{}))
 		req := cliproxyexecutor.Request{Model: tc.model, Payload: []byte(tc.payload)}
 		opts := func(stream bool) cliproxyexecutor.Options {
 			return cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString(tc.source), Stream: stream}

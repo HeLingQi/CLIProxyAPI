@@ -122,7 +122,7 @@ func TestIssue6332AntigravityResponsesDelivery(t *testing.T) {
 			}))
 			defer server.Close()
 			manager := cliproxyauth.NewManager(nil, nil, nil)
-			manager.RegisterExecutor(runtimeexecutor.NewAntigravityExecutor(&config.Config{}))
+			manager.RegisterExecutor(runtimeexecutor.NewAntigravityExecutor(&config.Config{Antigravity: config.AntigravityConfig{DisableControlPlane: true}}))
 			auth := &cliproxyauth.Auth{
 				ID: t.Name(), Provider: "antigravity", Status: cliproxyauth.StatusActive, ProxyURL: "direct",
 				Metadata: map[string]any{"access_token": "token", "expired": time.Now().Add(time.Hour).Format(time.RFC3339), "project_id": "project"}, Attributes: map[string]string{"base_url": server.URL},
@@ -307,7 +307,7 @@ func TestIssue6332ReasoningReplayTwoTurns(t *testing.T) {
 			}))
 			defer server.Close()
 			manager := cliproxyauth.NewManager(nil, nil, nil)
-			manager.RegisterExecutor(runtimeexecutor.NewAntigravityExecutor(&config.Config{}))
+			manager.RegisterExecutor(runtimeexecutor.NewAntigravityExecutor(&config.Config{Antigravity: config.AntigravityConfig{DisableControlPlane: true}}))
 			auth := &cliproxyauth.Auth{ID: t.Name(), Provider: "antigravity", Status: cliproxyauth.StatusActive, ProxyURL: "direct", Metadata: map[string]any{"access_token": "token", "expired": time.Now().Add(time.Hour).Format(time.RFC3339), "project_id": "project"}, Attributes: map[string]string{"base_url": server.URL}}
 			if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
 				t.Fatal(errRegister)
@@ -507,7 +507,7 @@ func TestIssue6332HTTPReentrantReplayDelivery(t *testing.T) {
 			}))
 			defer server.Close()
 			manager := cliproxyauth.NewManager(nil, nil, nil)
-			manager.RegisterExecutor(runtimeexecutor.NewAntigravityExecutor(&config.Config{}))
+			manager.RegisterExecutor(runtimeexecutor.NewAntigravityExecutor(&config.Config{Antigravity: config.AntigravityConfig{DisableControlPlane: true}}))
 			auth := &cliproxyauth.Auth{ID: t.Name(), Provider: "antigravity", Status: cliproxyauth.StatusActive, ProxyURL: "direct", Metadata: map[string]any{"access_token": "token", "expired": time.Now().Add(time.Hour).Format(time.RFC3339), "project_id": "project"}, Attributes: map[string]string{"base_url": server.URL}}
 			if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
 				t.Fatal(errRegister)

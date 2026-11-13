@@ -109,6 +109,25 @@ func AntigravityWebSearchModelFor(modelID string) string {
 	return ""
 }
 
+// AntigravityModelEnum returns the internal model identifier the account catalog reports for
+// modelID, which the Antigravity CLI echoes as a request label and in its trajectory report.
+// It returns an empty string when the catalog entry is unknown.
+func AntigravityModelEnum(modelID string) string {
+	modelID = normalizeAntigravityCapabilityModelID(modelID)
+	if modelID == "" {
+		return ""
+	}
+	for _, model := range GetGlobalRegistry().GetAvailableModelsByProvider("antigravity") {
+		if model == nil {
+			continue
+		}
+		if normalizeAntigravityCapabilityModelID(model.ID) == modelID {
+			return model.ModelEnum
+		}
+	}
+	return ""
+}
+
 // WithCodexBuiltins injects hard-coded Codex-only model definitions that should
 // not depend on remote models.json updates. Built-ins replace any matching IDs
 // already present in the provided slice.

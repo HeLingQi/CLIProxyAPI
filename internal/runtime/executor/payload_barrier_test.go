@@ -102,7 +102,7 @@ func TestPayloadBarrierAntigravityRebuiltAttempts(t *testing.T) {
 	req := cliproxyexecutor.Request{Model: "gemini-3.1-pro-preview"}
 	body := []byte(`{"request":{"contents":[{"role":"user","parts":[{"text":"first"}]},{"role":"user","parts":[{"text":"second"}]}]}}`)
 	ctx := helps.WithPayloadFinalizer(context.Background(), helps.NewPayloadFinalizer(cfg, "antigravity", req.Model, "antigravity", "request", body, req, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatGemini}))
-	executor := NewAntigravityExecutor(cfg)
+	executor := NewAntigravityExecutor(antigravityNoControlPlane(cfg))
 	auth := &cliproxyauth.Auth{Metadata: map[string]any{"project_id": "project-test"}}
 	for attempt := 0; attempt < 2; attempt++ {
 		request, errBuild := executor.buildRequest(ctx, auth, "token", req.Model, body, attempt == 1, "", "https://example.invalid", "injected-session")

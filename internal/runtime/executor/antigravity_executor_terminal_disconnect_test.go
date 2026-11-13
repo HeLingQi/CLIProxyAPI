@@ -51,10 +51,10 @@ func TestAntigravityStream_ClientDisconnectAfterTerminalChunkDoesNotReportFailur
 		server.Close()
 	}()
 
-	executor := NewAntigravityExecutor(&config.Config{
+	executor := NewAntigravityExecutor(antigravityNoControlPlane(&config.Config{
 		Antigravity:  config.AntigravityConfig{},
 		RequestRetry: 1,
-	})
+	}))
 
 	deliveryCtx, finishDelivery := usage.WithStreamDelivery(context.Background())
 	ctx, cancel := context.WithCancel(deliveryCtx)
@@ -143,10 +143,10 @@ func TestAntigravityStream_ClientDisconnectPlainContextAfterTerminalChunkDoesNot
 		server.Close()
 	}()
 
-	executor := NewAntigravityExecutor(&config.Config{
+	executor := NewAntigravityExecutor(antigravityNoControlPlane(&config.Config{
 		Antigravity:  config.AntigravityConfig{},
 		RequestRetry: 1,
-	})
+	}))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -231,10 +231,10 @@ func TestAntigravityStream_OpenAIChatCompletions_ClientDisconnectAfterStopChunkD
 		server.Close()
 	}()
 
-	executor := NewAntigravityExecutor(&config.Config{
+	executor := NewAntigravityExecutor(antigravityNoControlPlane(&config.Config{
 		Antigravity:  config.AntigravityConfig{},
 		RequestRetry: 1,
-	})
+	}))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
