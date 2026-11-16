@@ -335,6 +335,91 @@ func TestHistoryKeepsReportedAndEstimatedCostsSeparate(t *testing.T) {
 	}
 }
 
+func TestHistoryAggregatesByAPIKeyAndFilters(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "usage-sk.db")
+	if errConfigure := kvstore.ConfigureLocal(true, dbPath); errConfigure != nil {
+		t.Fatalf("ConfigureLocal() error = %v", errConfigure)
+	}
+	t.Cleanup(func() { _ = kvstore.ShutdownLocal() })
+
+	history := New(func() bool { return true })
+	requestedAt := time.Date(2026, time.November, 12, 10, 0, 0, 0, time.UTC)
+
+	// Key A request
+	history.HandleUsage(context.Background(), coreusage.Record{
+		Provider:     "claude",
+		ExecutorType: "claude",
+		APIKey:       "sk-user-alice-12345678",
+		RequestedAt:  requestedAt,
+		Detail: coreusage.Detail{
+			InputTokens:  100,
+			OutputTokens: 50,
+			TotalTokens:  150,
+			CostDetails:  &coreusage.CostDetails{Cost: coreusage.Float64Ptr(0.015)},
+		},
+	})
+	// Key B request
+	history.HandleUsage(context.Background(), coreusage.Record{
+		Provider:     "claude",
+		ExecutorType: "claude",
+		APIKey:       "sk-user-bob-87654321",
+		RequestedAt:  requestedAt.Add(time.Minute),
+		Detail: coreusage.Detail{
+			InputTokens:  200,
+			OutputTokens: 100,
+			TotalTokens:  300,
+			CostDetails:  &coreusage.CostDetails{Cost: coreusage.Float64Ptr(0.030)},
+		},
+	})
+
+	if errFlush := history.Flush(context.Background()); errFlush != nil {
+		t.Fatalf("Flush() error = %v", errFlush)
+	}
+
+	dateRange := DateRange{From: "2026-11-12", To: "2026-11-12"}
+	// 1. Global summary should list both keys under APIKeys
+	summary, errSummary := history.Summary(context.Background(), dateRange)
+	if errSummary != nil {
+		t.Fatalf("Summary() error = %v", errSummary)
+	}
+	if summary.Totals.Requests != 2 || summary.Totals.TotalTokens != 450 {
+		t.Fatalf("unexpected summary totals: %+v", summary.Totals)
+	}
+	if len(summary.APIKeys) != 2 {
+		t.Fatalf("expected 2 APIKeys in summary, got %d: %+v", len(summary.APIKeys), summary.APIKeys)
+	}
+	// Bob used 300 tokens, Alice used 150 tokens. Bob should be first.
+	bobFP := APIKeyFingerprint("sk-user-bob-87654321")
+	aliceFP := APIKeyFingerprint("sk-user-alice-12345678")
+	if summary.APIKeys[0].APIKeyFingerprint != bobFP || summary.APIKeys[0].TotalTokens != 300 {
+		t.Fatalf("expected Bob first, got: %+v", summary.APIKeys[0])
+	}
+	if summary.APIKeys[1].APIKeyFingerprint != aliceFP || summary.APIKeys[1].TotalTokens != 150 {
+		t.Fatalf("expected Alice second, got: %+v", summary.APIKeys[1])
+	}
+
+	// 2. Filtered summary by Alice's fingerprint
+	aliceSummary, errAlice := history.Summary(context.Background(), dateRange, aliceFP)
+	if errAlice != nil {
+		t.Fatalf("Summary(aliceFP) error = %v", errAlice)
+	}
+	if aliceSummary.Totals.Requests != 1 || aliceSummary.Totals.TotalTokens != 150 {
+		t.Fatalf("unexpected alice summary totals: %+v", aliceSummary.Totals)
+	}
+	if len(aliceSummary.APIKeys) != 1 || aliceSummary.APIKeys[0].APIKeyFingerprint != aliceFP {
+		t.Fatalf("unexpected alice summary APIKeys: %+v", aliceSummary.APIKeys)
+	}
+
+	// 3. Events query filtered by Bob's fingerprint
+	pageBob, errEventsBob := history.Events(context.Background(), EventsQuery{Limit: 10, APIKeyFingerprint: bobFP})
+	if errEventsBob != nil || len(pageBob.Items) != 1 {
+		t.Fatalf("Events(bobFP) error = %v, items = %d", errEventsBob, len(pageBob.Items))
+	}
+	if pageBob.Items[0].APIKeyFingerprint != bobFP || pageBob.Items[0].APIKeyMasked != "sk-user...4321" {
+		t.Fatalf("unexpected bob event item: %+v", pageBob.Items[0])
+	}
+}
+
 func assertSummaryTotals(t *testing.T, got Summary, want DailyAggregate) {
 	t.Helper()
 	if got.Timezone != "UTC" || got.From != "2026-11-12" || got.To != "2026-11-12" {

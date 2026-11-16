@@ -47,6 +47,7 @@ type Event struct {
 	Alias                  string    `json:"alias,omitempty"`
 	AccessProvider         string    `json:"access_provider,omitempty"`
 	APIKeyFingerprint      string    `json:"api_key_fingerprint,omitempty"`
+	APIKeyMasked           string    `json:"api_key_masked,omitempty"`
 	AuthID                 string    `json:"auth_id,omitempty"`
 	AuthIndex              string    `json:"auth_index,omitempty"`
 	AuthType               string    `json:"auth_type,omitempty"`
@@ -73,8 +74,9 @@ type Event struct {
 
 // EventsQuery requests records before an exclusive sequence cursor.
 type EventsQuery struct {
-	Limit  int
-	Before int64
+	Limit             int
+	Before            int64
+	APIKeyFingerprint string
 }
 
 // EventsPage contains newest-first redacted events and the next exclusive cursor.
@@ -154,6 +156,12 @@ func (h *History) Events(ctx context.Context, query EventsQuery) (EventsPage, er
 			if errDecode != nil {
 				return EventsPage{}, fmt.Errorf("decode usage event %d: %w", sequences[index], errDecode)
 			}
+			if query.APIKeyFingerprint != "" && event.APIKeyFingerprint != query.APIKeyFingerprint {
+				continue
+			}
+			if event.APIKeyFingerprint != "" {
+				event.APIKeyMasked = h.getMaskedKey(ctx, client, event.APIKeyFingerprint)
+			}
 			page.Items = append(page.Items, event)
 		}
 		cursor -= int64(batchSize)
@@ -198,7 +206,8 @@ func eventFromRecord(record coreusage.Record, timestamp time.Time, cost recordCo
 		Model:                  normalizedEventValue(record.Model),
 		Alias:                  sanitizeEventString(record.Alias),
 		AccessProvider:         sanitizeEventString(record.AccessProvider),
-		APIKeyFingerprint:      apiKeyFingerprint(record.APIKey),
+		APIKeyFingerprint:      APIKeyFingerprint(record.APIKey),
+		APIKeyMasked:           MaskAPIKey(record.APIKey),
 		AuthID:                 sanitizeEventString(record.AuthID),
 		AuthIndex:              sanitizeEventString(record.AuthIndex),
 		AuthType:               sanitizeEventString(record.AuthType),
@@ -251,13 +260,32 @@ func nonNegativeInt(value int) int64 {
 	return int64(value)
 }
 
-func apiKeyFingerprint(apiKey string) string {
+// APIKeyFingerprint returns the deterministic 8-byte hex SHA-256 fingerprint for an API key.
+func APIKeyFingerprint(apiKey string) string {
 	apiKey = strings.TrimSpace(apiKey)
 	if apiKey == "" {
 		return ""
 	}
 	digest := sha256.Sum256([]byte(apiKey))
 	return "sha256:" + hex.EncodeToString(digest[:8])
+}
+
+// MaskAPIKey returns a redacted representation of an API key safe for operator display.
+func MaskAPIKey(apiKey string) string {
+	apiKey = strings.TrimSpace(apiKey)
+	if apiKey == "" {
+		return ""
+	}
+	if len(apiKey) <= 8 {
+		if len(apiKey) <= 3 {
+			return "***"
+		}
+		return apiKey[:1] + "..." + apiKey[len(apiKey)-1:]
+	}
+	if strings.HasPrefix(apiKey, "sk-") && len(apiKey) > 12 {
+		return apiKey[:7] + "..." + apiKey[len(apiKey)-4:]
+	}
+	return apiKey[:4] + "..." + apiKey[len(apiKey)-4:]
 }
 
 func flushStoredEvents(ctx context.Context, client kvstore.KVClient, events []Event) error {

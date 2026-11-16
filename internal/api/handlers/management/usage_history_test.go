@@ -96,6 +96,80 @@ func TestGetUsageHistoryEventsReturnsRedactedRecords(t *testing.T) {
 	if ojson.Get(body, "items.0.api_key").Exists() {
 		t.Fatalf("response exposed raw api_key: %s", body)
 	}
+	if got := ojson.Get(body, "items.0.api_key_masked").String(); got == "" || got == "sk-secret-value" {
+		t.Fatalf("api_key_masked = %q, want redacted masked value", got)
+	}
+}
+
+func TestGetUsageHistorySummaryAndEventsFilteredByAPIKey(t *testing.T) {
+	if errConfigure := kvstore.ConfigureLocal(true, filepath.Join(t.TempDir(), "usage-sk-filter.db")); errConfigure != nil {
+		t.Fatalf("ConfigureLocal() error = %v", errConfigure)
+	}
+	t.Cleanup(func() { _ = kvstore.ShutdownLocal() })
+
+	history := usagehistory.New(func() bool { return true })
+	t.Cleanup(func() { _ = history.Close(context.Background()) })
+	history.HandleUsage(context.Background(), coreusage.Record{
+		RequestID:   "req-1",
+		Provider:    "codex",
+		Model:       "gpt-5.4",
+		APIKey:      "sk-proj-alpha-12345678",
+		RequestedAt: time.Date(2026, time.November, 12, 10, 0, 0, 0, time.UTC),
+		Detail:      coreusage.Detail{InputTokens: 10, OutputTokens: 5, TotalTokens: 15},
+	})
+	history.HandleUsage(context.Background(), coreusage.Record{
+		RequestID:   "req-2",
+		Provider:    "codex",
+		Model:       "gpt-5.4",
+		APIKey:      "sk-proj-beta-87654321",
+		RequestedAt: time.Date(2026, time.November, 12, 10, 1, 0, 0, time.UTC),
+		Detail:      coreusage.Detail{InputTokens: 20, OutputTokens: 10, TotalTokens: 30},
+	})
+
+	handler := &Handler{}
+	handler.SetUsageHistory(history)
+
+	// Summary returns api_keys array with both keys
+	recSummary := httptest.NewRecorder()
+	cSummary, _ := gin.CreateTestContext(recSummary)
+	cSummary.Request = httptest.NewRequest(http.MethodGet, "/v8/management/observability/usage/summary?from=2026-11-12&to=2026-11-12", nil)
+	handler.GetUsageHistorySummary(cSummary)
+	if recSummary.Code != http.StatusOK {
+		t.Fatalf("summary status = %d, body=%s", recSummary.Code, recSummary.Body.String())
+	}
+	summaryBody := recSummary.Body.String()
+	if got := ojson.Get(summaryBody, "api_keys.#").Int(); got != 2 {
+		t.Fatalf("api_keys count = %d, want 2. body=%s", got, summaryBody)
+	}
+
+	// Filtered by api_key (raw key query)
+	recAlpha := httptest.NewRecorder()
+	cAlpha, _ := gin.CreateTestContext(recAlpha)
+	cAlpha.Request = httptest.NewRequest(http.MethodGet, "/v8/management/observability/usage/summary?from=2026-11-12&to=2026-11-12&api_key=sk-proj-alpha-12345678", nil)
+	handler.GetUsageHistorySummary(cAlpha)
+	if recAlpha.Code != http.StatusOK {
+		t.Fatalf("alpha summary status = %d, body=%s", recAlpha.Code, recAlpha.Body.String())
+	}
+	alphaBody := recAlpha.Body.String()
+	if got := ojson.Get(alphaBody, "totals.total_tokens").Int(); got != 15 {
+		t.Fatalf("alpha total_tokens = %d, want 15. body=%s", got, alphaBody)
+	}
+
+	// Events filtered by api_key
+	recEvents := httptest.NewRecorder()
+	cEvents, _ := gin.CreateTestContext(recEvents)
+	cEvents.Request = httptest.NewRequest(http.MethodGet, "/v8/management/observability/usage/events?api_key=sk-proj-alpha-12345678", nil)
+	handler.GetUsageHistoryEvents(cEvents)
+	if recEvents.Code != http.StatusOK {
+		t.Fatalf("events status = %d, body=%s", recEvents.Code, recEvents.Body.String())
+	}
+	eventsBody := recEvents.Body.String()
+	if got := ojson.Get(eventsBody, "items.#").Int(); got != 1 {
+		t.Fatalf("events items count = %d, want 1. body=%s", got, eventsBody)
+	}
+	if got := ojson.Get(eventsBody, "items.0.request_id").String(); got != "req-1" {
+		t.Fatalf("events items[0].request_id = %q, want req-1", got)
+	}
 }
 
 func TestGetUsageHistorySummaryRejectsInvalidRange(t *testing.T) {

@@ -3,9 +3,11 @@ package usagehistory
 import (
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -19,6 +21,9 @@ import (
 
 const (
 	dailyKeyPrefix       = "usage-history:day:"
+	skDayKeyPrefix       = "usage-history:sk-day:"
+	skTotalKeyPrefix     = "usage-history:sk-total:"
+	skIndexKey           = "usage-history:sk-index"
 	dailyEncodingVersion = byte(1)
 	dailyFieldCount      = 14
 	dailyEncodingSize    = 1 + dailyFieldCount*8
@@ -53,6 +58,19 @@ type DailyAggregate struct {
 	TTFTMs                 int64 `json:"ttft_total_ms"`
 }
 
+// APIKeyAggregate contains the usage counters aggregated for a specific client API key.
+type APIKeyAggregate struct {
+	APIKeyFingerprint string `json:"api_key_fingerprint"`
+	APIKeyMasked      string `json:"api_key_masked"`
+	DailyAggregate
+}
+
+// SKMetadata stores index entries for known API keys.
+type SKMetadata struct {
+	Fingerprint string `json:"api_key_fingerprint"`
+	Masked      string `json:"api_key_masked"`
+}
+
 // Day contains one UTC date and its aggregate.
 type Day struct {
 	Date string `json:"date"`
@@ -61,11 +79,12 @@ type Day struct {
 
 // Summary is the native persisted usage overview returned by the management API.
 type Summary struct {
-	From     string         `json:"from"`
-	To       string         `json:"to"`
-	Timezone string         `json:"timezone"`
-	Totals   DailyAggregate `json:"totals"`
-	Days     []Day          `json:"days"`
+	From     string            `json:"from"`
+	To       string            `json:"to"`
+	Timezone string            `json:"timezone"`
+	Totals   DailyAggregate    `json:"totals"`
+	Days     []Day             `json:"days"`
+	APIKeys  []APIKeyAggregate `json:"api_keys,omitempty"`
 }
 
 // History consumes normalized core usage records and batches daily aggregates into the active KV store.
@@ -74,10 +93,13 @@ type History struct {
 	now            func() time.Time
 	pricingCatalog *pricing.Catalog
 
-	mu            sync.Mutex
-	pending       map[string]DailyAggregate
-	pendingEvents []Event
-	flushMu       sync.Mutex
+	mu             sync.Mutex
+	pending        map[string]DailyAggregate
+	pendingSKDay   map[string]DailyAggregate
+	pendingSKTotal map[string]DailyAggregate
+	knownSKs       map[string]SKMetadata
+	pendingEvents  []Event
+	flushMu        sync.Mutex
 
 	startOnce     sync.Once
 	closeOnce     sync.Once
@@ -94,11 +116,14 @@ func New(enabled func() bool, catalogs ...*pricing.Catalog) *History {
 		enabled = func() bool { return true }
 	}
 	history := &History{
-		enabled: enabled,
-		now:     time.Now,
-		pending: make(map[string]DailyAggregate),
-		stop:    make(chan struct{}),
-		done:    make(chan struct{}),
+		enabled:        enabled,
+		now:            time.Now,
+		pending:        make(map[string]DailyAggregate),
+		pendingSKDay:   make(map[string]DailyAggregate),
+		pendingSKTotal: make(map[string]DailyAggregate),
+		knownSKs:       make(map[string]SKMetadata),
+		stop:           make(chan struct{}),
+		done:           make(chan struct{}),
 	}
 	if len(catalogs) > 0 {
 		history.pricingCatalog = catalogs[0]
@@ -146,6 +171,12 @@ func (h *History) HandleUsage(_ context.Context, record coreusage.Record) {
 	delta := aggregateRecord(record, cost)
 	event := eventFromRecord(record, timestamp, cost)
 
+	fp := APIKeyFingerprint(record.APIKey)
+	masked := MaskAPIKey(record.APIKey)
+	if fp != "" {
+		event.APIKeyMasked = masked
+	}
+
 	h.mu.Lock()
 	current := h.pending[day]
 	if errMerge := mergeAggregate(&current, delta); errMerge == nil {
@@ -153,6 +184,22 @@ func (h *History) HandleUsage(_ context.Context, record coreusage.Record) {
 	} else {
 		log.WithError(errMerge).Warn("usage history aggregate overflow")
 	}
+
+	if fp != "" {
+		skDayKey := fp + ":" + day
+		skDayCurrent := h.pendingSKDay[skDayKey]
+		if errMerge := mergeAggregate(&skDayCurrent, delta); errMerge == nil {
+			h.pendingSKDay[skDayKey] = skDayCurrent
+		}
+		skTotalCurrent := h.pendingSKTotal[fp]
+		if errMerge := mergeAggregate(&skTotalCurrent, delta); errMerge == nil {
+			h.pendingSKTotal[fp] = skTotalCurrent
+		}
+		if _, exists := h.knownSKs[fp]; !exists {
+			h.knownSKs[fp] = SKMetadata{Fingerprint: fp, Masked: masked}
+		}
+	}
+
 	if len(h.pendingEvents) < maxPendingEvents {
 		h.pendingEvents = append(h.pendingEvents, event)
 	} else if dropped := h.droppedEvents.Add(1); dropped == 1 || dropped%1000 == 0 {
@@ -177,33 +224,62 @@ func (h *History) Flush(ctx context.Context) error {
 func (h *History) flushLocked(ctx context.Context) error {
 	h.mu.Lock()
 	pending := h.pending
+	pendingSKDay := h.pendingSKDay
+	pendingSKTotal := h.pendingSKTotal
 	pendingEvents := h.pendingEvents
+	knownSKs := make(map[string]SKMetadata, len(h.knownSKs))
+	for k, v := range h.knownSKs {
+		knownSKs[k] = v
+	}
 	h.pending = make(map[string]DailyAggregate)
+	h.pendingSKDay = make(map[string]DailyAggregate)
+	h.pendingSKTotal = make(map[string]DailyAggregate)
 	h.pendingEvents = nil
 	h.mu.Unlock()
-	if len(pending) == 0 && len(pendingEvents) == 0 {
+	if len(pending) == 0 && len(pendingSKDay) == 0 && len(pendingSKTotal) == 0 && len(pendingEvents) == 0 {
 		return nil
 	}
 
 	client, kvMode, errClient := kvstore.CurrentKVClient()
 	if errClient != nil {
-		h.restorePending(pending)
+		h.restorePending(pending, pendingSKDay, pendingSKTotal)
 		h.restoreEvents(pendingEvents)
 		return errClient
 	}
 	if !kvMode || client == nil {
-		h.restorePending(pending)
+		h.restorePending(pending, pendingSKDay, pendingSKTotal)
 		h.restoreEvents(pendingEvents)
 		return nil
 	}
 
 	for day, delta := range pending {
-		if errMerge := mergeStoredDay(ctx, client, day, delta); errMerge != nil {
-			h.restorePending(pending)
+		if errMerge := mergeStoredAggregate(ctx, client, dailyKeyPrefix+day, delta); errMerge != nil {
+			h.restorePending(pending, pendingSKDay, pendingSKTotal)
 			h.restoreEvents(pendingEvents)
 			return errMerge
 		}
 		delete(pending, day)
+	}
+	for skDayKey, delta := range pendingSKDay {
+		if errMerge := mergeStoredAggregate(ctx, client, skDayKeyPrefix+skDayKey, delta); errMerge != nil {
+			h.restorePending(pending, pendingSKDay, pendingSKTotal)
+			h.restoreEvents(pendingEvents)
+			return errMerge
+		}
+		delete(pendingSKDay, skDayKey)
+	}
+	for fp, delta := range pendingSKTotal {
+		if errMerge := mergeStoredAggregate(ctx, client, skTotalKeyPrefix+fp, delta); errMerge != nil {
+			h.restorePending(pending, pendingSKDay, pendingSKTotal)
+			h.restoreEvents(pendingEvents)
+			return errMerge
+		}
+		delete(pendingSKTotal, fp)
+	}
+	if len(knownSKs) > 0 {
+		if errIndex := syncStoredSKIndex(ctx, client, knownSKs); errIndex != nil {
+			log.WithError(errIndex).Warn("failed to update usage history sk index")
+		}
 	}
 	if errEvents := flushStoredEvents(ctx, client, pendingEvents); errEvents != nil {
 		h.restoreEvents(pendingEvents)
@@ -212,19 +288,33 @@ func (h *History) flushLocked(ctx context.Context) error {
 	return nil
 }
 
-func (h *History) restorePending(items map[string]DailyAggregate) {
-	if len(items) == 0 {
+func (h *History) restorePending(days, skDays, skTotals map[string]DailyAggregate) {
+	if len(days) == 0 && len(skDays) == 0 && len(skTotals) == 0 {
 		return
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	for day, delta := range items {
+	for day, delta := range days {
 		current := h.pending[day]
 		if errMerge := mergeAggregate(&current, delta); errMerge != nil {
 			log.WithError(errMerge).Warn("usage history pending restore overflow")
 			continue
 		}
 		h.pending[day] = current
+	}
+	for key, delta := range skDays {
+		current := h.pendingSKDay[key]
+		if errMerge := mergeAggregate(&current, delta); errMerge != nil {
+			continue
+		}
+		h.pendingSKDay[key] = current
+	}
+	for fp, delta := range skTotals {
+		current := h.pendingSKTotal[fp]
+		if errMerge := mergeAggregate(&current, delta); errMerge != nil {
+			continue
+		}
+		h.pendingSKTotal[fp] = current
 	}
 }
 
@@ -250,7 +340,8 @@ func (h *History) restoreEvents(items []Event) {
 }
 
 // Summary returns persisted and not-yet-persisted aggregates for an inclusive UTC date range.
-func (h *History) Summary(ctx context.Context, dateRange DateRange) (Summary, error) {
+// Optional filters[0] restricts results to a specific client API key fingerprint.
+func (h *History) Summary(ctx context.Context, dateRange DateRange, filters ...string) (Summary, error) {
 	if h == nil {
 		return Summary{}, errors.New("usage history unavailable")
 	}
@@ -272,17 +363,81 @@ func (h *History) Summary(ctx context.Context, dateRange DateRange) (Summary, er
 		return Summary{}, fmt.Errorf("flush usage history: %w", errFlush)
 	}
 
+	targetFP := ""
+	if len(filters) > 0 {
+		targetFP = strings.TrimSpace(filters[0])
+	}
+
+	client, kvMode, errClient := kvstore.CurrentKVClient()
+	if errClient != nil {
+		return Summary{}, errClient
+	}
+
 	dates := datesInclusive(from, to)
+
+	if targetFP != "" {
+		targetKeys := make([]string, len(dates))
+		for index := range dates {
+			targetKeys[index] = skDayKeyPrefix + targetFP + ":" + dates[index]
+		}
+		stored := make([]DailyAggregate, len(dates))
+		if kvMode && client != nil {
+			values, found, errGet := client.KVMGet(ctx, targetKeys...)
+			if errGet != nil {
+				return Summary{}, fmt.Errorf("read usage history: %w", errGet)
+			}
+			for index := range dates {
+				if !found[index] {
+					continue
+				}
+				aggregate, errDecode := decodeDailyAggregate(values[index])
+				if errDecode != nil {
+					return Summary{}, fmt.Errorf("decode usage history for %s: %w", dates[index], errDecode)
+				}
+				stored[index] = aggregate
+			}
+		}
+
+		h.mu.Lock()
+		pendingSKDay := make(map[string]DailyAggregate, len(h.pendingSKDay))
+		for k, v := range h.pendingSKDay {
+			pendingSKDay[k] = v
+		}
+		h.mu.Unlock()
+		maskedKey := h.getMaskedKey(ctx, client, targetFP)
+
+		summary := Summary{
+			From:     from.Format(time.DateOnly),
+			To:       to.Format(time.DateOnly),
+			Timezone: "UTC",
+			Days:     make([]Day, len(dates)),
+		}
+		for index, day := range dates {
+			aggregate := stored[index]
+			if delta, ok := pendingSKDay[targetFP+":"+day]; ok {
+				if errMerge := mergeAggregate(&aggregate, delta); errMerge != nil {
+					return Summary{}, errMerge
+				}
+			}
+			summary.Days[index] = Day{Date: day, DailyAggregate: aggregate}
+			if errMerge := mergeAggregate(&summary.Totals, aggregate); errMerge != nil {
+				return Summary{}, errMerge
+			}
+		}
+		summary.APIKeys = []APIKeyAggregate{{
+			APIKeyFingerprint: targetFP,
+			APIKeyMasked:      maskedKey,
+			DailyAggregate:    summary.Totals,
+		}}
+		return summary, nil
+	}
+
 	keys := make([]string, len(dates))
 	for index := range dates {
 		keys[index] = dailyKeyPrefix + dates[index]
 	}
 
 	stored := make([]DailyAggregate, len(dates))
-	client, kvMode, errClient := kvstore.CurrentKVClient()
-	if errClient != nil {
-		return Summary{}, errClient
-	}
 	if kvMode && client != nil {
 		values, found, errGet := client.KVMGet(ctx, keys...)
 		if errGet != nil {
@@ -305,6 +460,10 @@ func (h *History) Summary(ctx context.Context, dateRange DateRange) (Summary, er
 	for day, aggregate := range h.pending {
 		pending[day] = aggregate
 	}
+	pendingSKDay := make(map[string]DailyAggregate, len(h.pendingSKDay))
+	for k, v := range h.pendingSKDay {
+		pendingSKDay[k] = v
+	}
 	h.mu.Unlock()
 
 	summary := Summary{
@@ -325,6 +484,62 @@ func (h *History) Summary(ctx context.Context, dateRange DateRange) (Summary, er
 			return Summary{}, errMerge
 		}
 	}
+
+	sks := h.loadSKIndex(ctx, client)
+	if len(sks) > 0 {
+		type skEntry struct {
+			fp     string
+			masked string
+		}
+		skList := make([]skEntry, 0, len(sks))
+		for fp, meta := range sks {
+			skList = append(skList, skEntry{fp: fp, masked: meta.Masked})
+		}
+		allSKKeys := make([]string, 0, len(skList)*len(dates))
+		for _, sk := range skList {
+			for _, day := range dates {
+				allSKKeys = append(allSKKeys, skDayKeyPrefix+sk.fp+":"+day)
+			}
+		}
+		var allSKValues [][]byte
+		var allSKFound []bool
+		if kvMode && client != nil && len(allSKKeys) > 0 {
+			allSKValues, allSKFound, _ = client.KVMGet(ctx, allSKKeys...)
+		}
+		keyIndex := 0
+		apiKeysAgg := make([]APIKeyAggregate, 0, len(skList))
+		for _, sk := range skList {
+			skTotal := DailyAggregate{}
+			for _, day := range dates {
+				var dayAgg DailyAggregate
+				if keyIndex < len(allSKValues) && allSKFound[keyIndex] {
+					if dec, err := decodeDailyAggregate(allSKValues[keyIndex]); err == nil {
+						dayAgg = dec
+					}
+				}
+				keyIndex++
+				if delta, ok := pendingSKDay[sk.fp+":"+day]; ok {
+					_ = mergeAggregate(&dayAgg, delta)
+				}
+				_ = mergeAggregate(&skTotal, dayAgg)
+			}
+			if skTotal.Requests > 0 {
+				apiKeysAgg = append(apiKeysAgg, APIKeyAggregate{
+					APIKeyFingerprint: sk.fp,
+					APIKeyMasked:      sk.masked,
+					DailyAggregate:    skTotal,
+				})
+			}
+		}
+		sort.Slice(apiKeysAgg, func(i, j int) bool {
+			if apiKeysAgg[i].TotalTokens != apiKeysAgg[j].TotalTokens {
+				return apiKeysAgg[i].TotalTokens > apiKeysAgg[j].TotalTokens
+			}
+			return apiKeysAgg[i].Requests > apiKeysAgg[j].Requests
+		})
+		summary.APIKeys = apiKeysAgg
+	}
+
 	return summary, nil
 }
 
@@ -467,8 +682,7 @@ func reportedCostUSDMicros(cost *coreusage.CostDetails) int64 {
 	return value
 }
 
-func mergeStoredDay(ctx context.Context, client kvstore.KVClient, day string, delta DailyAggregate) error {
-	key := dailyKeyPrefix + day
+func mergeStoredAggregate(ctx context.Context, client kvstore.KVClient, key string, delta DailyAggregate) error {
 	for attempt := 0; attempt < maxCASAttempts; attempt++ {
 		if errContext := ctx.Err(); errContext != nil {
 			return errContext
@@ -498,6 +712,78 @@ func mergeStoredDay(ctx context.Context, client kvstore.KVClient, day string, de
 		}
 	}
 	return errors.New("usage history update contention exceeded retry limit")
+}
+
+func (h *History) getMaskedKey(ctx context.Context, client kvstore.KVClient, fingerprint string) string {
+	if fingerprint == "" {
+		return ""
+	}
+	h.mu.Lock()
+	if meta, ok := h.knownSKs[fingerprint]; ok && meta.Masked != "" {
+		h.mu.Unlock()
+		return meta.Masked
+	}
+	h.mu.Unlock()
+
+	sks := h.loadSKIndex(ctx, client)
+	if meta, ok := sks[fingerprint]; ok && meta.Masked != "" {
+		h.mu.Lock()
+		h.knownSKs[fingerprint] = meta
+		h.mu.Unlock()
+		return meta.Masked
+	}
+	return ""
+}
+
+func (h *History) loadSKIndex(ctx context.Context, client kvstore.KVClient) map[string]SKMetadata {
+	h.mu.Lock()
+	result := make(map[string]SKMetadata, len(h.knownSKs))
+	for k, v := range h.knownSKs {
+		result[k] = v
+	}
+	h.mu.Unlock()
+
+	if client != nil {
+		raw, found, errGet := client.KVGet(ctx, skIndexKey)
+		if errGet == nil && found && len(raw) > 0 {
+			var stored map[string]SKMetadata
+			if errUnmarshal := json.Unmarshal(raw, &stored); errUnmarshal == nil {
+				for k, v := range stored {
+					if _, exists := result[k]; !exists {
+						result[k] = v
+					}
+				}
+			}
+		}
+	}
+	return result
+}
+
+func syncStoredSKIndex(ctx context.Context, client kvstore.KVClient, inMemory map[string]SKMetadata) error {
+	raw, found, errGet := client.KVGet(ctx, skIndexKey)
+	if errGet != nil {
+		return errGet
+	}
+	stored := make(map[string]SKMetadata)
+	if found && len(raw) > 0 {
+		_ = json.Unmarshal(raw, &stored)
+	}
+	changed := false
+	for fp, meta := range inMemory {
+		if existing, ok := stored[fp]; !ok || existing.Masked != meta.Masked {
+			stored[fp] = meta
+			changed = true
+		}
+	}
+	if !changed && found {
+		return nil
+	}
+	data, errMarshal := json.Marshal(stored)
+	if errMarshal != nil {
+		return errMarshal
+	}
+	_, errSet := client.KVSet(ctx, skIndexKey, data, kvstore.KVSetOptions{})
+	return errSet
 }
 
 func mergeAggregate(target *DailyAggregate, delta DailyAggregate) error {

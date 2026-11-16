@@ -25,10 +25,17 @@ func (h *Handler) GetUsageHistorySummary(c *gin.Context) {
 		return
 	}
 
+	apiKeyFingerprint := strings.TrimSpace(c.Query("api_key_fingerprint"))
+	if apiKeyFingerprint == "" {
+		if rawKey := strings.TrimSpace(c.Query("api_key")); rawKey != "" {
+			apiKeyFingerprint = usagehistory.APIKeyFingerprint(rawKey)
+		}
+	}
+
 	summary, errSummary := history.Summary(c.Request.Context(), usagehistory.DateRange{
 		From: c.Query("from"),
 		To:   c.Query("to"),
-	})
+	}, apiKeyFingerprint)
 	if errSummary != nil {
 		if errors.Is(errSummary, usagehistory.ErrInvalidDateRange) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": errSummary.Error()})
@@ -56,6 +63,11 @@ func (h *Handler) GetUsageHistoryEvents(c *gin.Context) {
 	}
 
 	query := usagehistory.EventsQuery{}
+	if fp := strings.TrimSpace(c.Query("api_key_fingerprint")); fp != "" {
+		query.APIKeyFingerprint = fp
+	} else if rawKey := strings.TrimSpace(c.Query("api_key")); rawKey != "" {
+		query.APIKeyFingerprint = usagehistory.APIKeyFingerprint(rawKey)
+	}
 	if value := strings.TrimSpace(c.Query("limit")); value != "" {
 		limit, errLimit := strconv.Atoi(value)
 		if errLimit != nil {
