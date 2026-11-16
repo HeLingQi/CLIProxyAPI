@@ -257,6 +257,10 @@ func (h *History) Summary(ctx context.Context, dateRange DateRange) (Summary, er
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if strings.TrimSpace(dateRange.From) == "" && strings.TrimSpace(dateRange.To) == "" {
+		today := h.now().UTC().Format(time.DateOnly)
+		dateRange = DateRange{From: today, To: today}
+	}
 	from, to, errRange := parseDateRange(dateRange)
 	if errRange != nil {
 		return Summary{}, errRange
@@ -399,7 +403,15 @@ func resolveRecordCost(record coreusage.Record, catalog *pricing.Catalog) record
 			UncachedInput:   breakdown.Input.UncachedTokens,
 			CacheReadInput:  breakdown.Input.CacheReadTokens,
 			CacheWriteInput: breakdown.Input.CacheWriteTokens,
+			CacheWrite1h:    usagePointerValue(detail.CacheCreation1hTokens),
+			CacheWrite12h:   usagePointerValue(detail.CacheCreation12hTokens),
 			Output:          breakdown.Output.TotalTokens,
+			AudioInput:      usagePointerValue(detail.AudioInputTokens),
+			AudioOutput:     usagePointerValue(detail.AudioOutputTokens),
+			InputLength:     breakdown.Input.TotalTokens,
+			ImageCount:      usagePointerValue(detail.ImageCount),
+			Thinking:        breakdown.Output.ReasoningTokens > 0 || strings.TrimSpace(record.ReasoningEffort) != "",
+			At:              record.RequestedAt,
 		})
 	}
 	cost := recordCost{reported: reported, pricingRevision: quote.Revision}
@@ -415,6 +427,13 @@ func resolveRecordCost(record coreusage.Record, catalog *pricing.Catalog) record
 		cost.source = "catalog"
 	}
 	return cost
+}
+
+func usagePointerValue(value *int64) int64 {
+	if value == nil || *value < 0 {
+		return 0
+	}
+	return *value
 }
 
 func reportedCost(cost *coreusage.CostDetails) (int64, bool) {

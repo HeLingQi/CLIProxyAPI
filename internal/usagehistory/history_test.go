@@ -245,6 +245,28 @@ func TestHistoryUsesMemorySummaryWhenKVIsDisabled(t *testing.T) {
 	}
 }
 
+func TestHistoryDefaultsEmptySummaryRangeToCurrentUTCDay(t *testing.T) {
+	if errShutdown := kvstore.ShutdownLocal(); errShutdown != nil {
+		t.Fatalf("ShutdownLocal() error = %v", errShutdown)
+	}
+	current := time.Date(2026, time.November, 16, 23, 30, 0, 0, time.FixedZone("UTC+8", 8*60*60))
+	history := New(func() bool { return true })
+	history.now = func() time.Time { return current }
+	t.Cleanup(func() { _ = history.Close(context.Background()) })
+	history.HandleUsage(context.Background(), coreusage.Record{
+		RequestedAt: current,
+		Detail:      coreusage.Detail{TotalTokens: 7},
+	})
+
+	summary, errSummary := history.Summary(context.Background(), DateRange{})
+	if errSummary != nil {
+		t.Fatalf("Summary() error = %v", errSummary)
+	}
+	if summary.From != "2026-11-16" || summary.To != "2026-11-16" || summary.Totals.Requests != 1 || summary.Totals.TotalTokens != 7 {
+		t.Fatalf("Summary() = %+v, want the current UTC day and its pending usage", summary)
+	}
+}
+
 func TestHistoryKeepsReportedAndEstimatedCostsSeparate(t *testing.T) {
 	if errConfigure := kvstore.ConfigureLocal(true, filepath.Join(t.TempDir(), "usage-pricing.db")); errConfigure != nil {
 		t.Fatalf("ConfigureLocal() error = %v", errConfigure)

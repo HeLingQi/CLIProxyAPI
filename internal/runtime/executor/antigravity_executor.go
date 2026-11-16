@@ -11,7 +11,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -29,6 +31,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/proxyutil"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 	log "github.com/sirupsen/logrus"
+	"golang.org/x/net/idna"
 )
 
 const (
@@ -272,9 +275,6 @@ type antigravityTransportKey struct {
 	shortMode           bool
 	idleConnTimeout     time.Duration
 	maxIdleConnsPerHost int
-	// http2 separates the HTTP/2 pools from the HTTP/1.1 ones because a reload of the
-	// protocol setting must not reuse a pool negotiating the other protocol.
-	http2 bool
 }
 
 func defaultAntigravityBaseTransport() *http.Transport {
@@ -284,25 +284,225 @@ func defaultAntigravityBaseTransport() *http.Transport {
 	return &http.Transport{}
 }
 
+const (
+	antigravityHTTP2SendPingTimeout      = 15 * time.Second
+	antigravityHTTP2PingTimeout          = 15 * time.Second
+	antigravityShortModeHTTP2IdleTimeout = time.Second
+)
+
 func cloneTransportWithHTTP11(base *http.Transport, cfgs ...*config.Config) *http.Transport {
 	if base == nil {
 		return nil
 	}
 
 	clone := base.Clone()
-	clone.ForceAttemptHTTP2 = false
-	// Wipe TLSNextProto to prevent implicit HTTP/2 upgrade.
-	clone.TLSNextProto = make(map[string]func(authority string, c *tls.Conn) http.RoundTripper)
+	// Save the base TLS config before rewriting NextProtos so any outer HTTPS
+	// proxy handshake keeps HTTP/1.1 CONNECT framing instead of negotiating h2.
+	var proxyBaseTLS *tls.Config
+	if base.TLSClientConfig != nil {
+		proxyBaseTLS = base.TLSClientConfig.Clone()
+	}
+
+	// The official client offers ALPN [h2, http/1.1] and can speak either
+	// protocol, so the clone advertises the same list instead of omitting ALPN.
+	// A nil TLSNextProto keeps that promise honest: the bundled HTTP/2
+	// implementation is registered, so a frontend that ever answers ALPN h2 is
+	// followed onto HTTP/2 rather than failing the handshake. The Google
+	// frontend answers neither today, so requests still run on HTTP/1.1.
+	clone.ForceAttemptHTTP2 = true
+	clone.TLSNextProto = nil
 	if clone.TLSClientConfig == nil {
 		clone.TLSClientConfig = &tls.Config{}
 	} else {
 		clone.TLSClientConfig = clone.TLSClientConfig.Clone()
 	}
-	// Native Antigravity sends no ALPN extension. With HTTP/2 disabled above,
-	// an empty NextProtos keeps the wire shape aligned while using HTTP/1.1.
-	clone.TLSClientConfig.NextProtos = nil
+	clone.TLSClientConfig.NextProtos = []string{"h2", "http/1.1"}
+
+	// Configure HTTP/2 PING health checks so idle h2 connections silently dropped
+	// by NATs or Google Frontend are detected rather than failing live streams.
+	if clone.HTTP2 == nil {
+		clone.HTTP2 = &http.HTTP2Config{}
+	} else {
+		http2Clone := *clone.HTTP2
+		clone.HTTP2 = &http2Clone
+	}
+	if clone.HTTP2.SendPingTimeout <= 0 {
+		clone.HTTP2.SendPingTimeout = antigravityHTTP2SendPingTimeout
+	}
+	if clone.HTTP2.PingTimeout <= 0 {
+		clone.HTTP2.PingTimeout = antigravityHTTP2PingTimeout
+	}
+
+	// Guard HTTPS proxies configured through Transport.Proxy (such as HTTPS_PROXY
+	// in the environment) when no custom DialTLSContext was installed: Go's
+	// built-in HTTPS proxy dialer otherwise reuses TLSClientConfig.NextProtos
+	// ("h2") on the outer proxy socket, breaking HTTP/1.1 CONNECT framing.
+	// Multiple probe hosts (including a neutral domain outside *.googleapis.com)
+	// ensure NO_PROXY exclusions do not hide an active HTTPS_PROXY, and runtime
+	// proxy address tracking preserves native [h2, http/1.1] ALPN + target SNI
+	// whenever Proxy(req) returns nil for a direct NO_PROXY destination.
+	if clone.DialTLS == nil && clone.DialTLSContext == nil && clone.Proxy != nil {
+		httpsProxyAddrs := &sync.Map{}
+		hasHTTPSProxy := false
+		for _, host := range []string{
+			"daily-cloudcode-pa.googleapis.com",
+			"cloudcode-pa.googleapis.com",
+			"antigravity-proxy-probe.invalid",
+		} {
+			probeReq := &http.Request{URL: &url.URL{Scheme: "https", Host: host}}
+			if pURL, errProxy := clone.Proxy(probeReq); errProxy == nil && pURL != nil && strings.EqualFold(pURL.Scheme, "https") {
+				if addr := antigravityCanonicalHTTPSAddr(pURL); addr != "" {
+					httpsProxyAddrs.Store(addr, pURL.Hostname())
+					hasHTTPSProxy = true
+				}
+			}
+		}
+		if hasHTTPSProxy {
+			origProxy := clone.Proxy
+			clone.Proxy = func(req *http.Request) (*url.URL, error) {
+				pURL, errProxy := origProxy(req)
+				if errProxy == nil && pURL != nil && strings.EqualFold(pURL.Scheme, "https") {
+					if addr := antigravityCanonicalHTTPSAddr(pURL); addr != "" {
+						httpsProxyAddrs.Store(addr, pURL.Hostname())
+					}
+				}
+				return pURL, errProxy
+			}
+			clone.DialTLSContext = buildAntigravityHTTPSProxyDialTLSContext(
+				httpsProxyAddrs,
+				proxyBaseTLS,
+				clone.TLSClientConfig,
+				clone.TLSHandshakeTimeout,
+				clone.DialContext,
+			)
+		}
+	}
+
 	applyAntigravityPoolLimits(clone, cfgs...)
 	return clone
+}
+
+func antigravityCanonicalHTTPSAddr(u *url.URL) string {
+	if u == nil {
+		return ""
+	}
+	host := u.Hostname()
+	if host == "" {
+		return ""
+	}
+	port := u.Port()
+	if port == "" {
+		port = "443"
+	}
+	return net.JoinHostPort(host, port)
+}
+
+func antigravityTLSServerName(rawHost string) string {
+	host := strings.TrimSpace(rawHost)
+	if host == "" {
+		return ""
+	}
+	if splitHost, _, errSplit := net.SplitHostPort(host); errSplit == nil && splitHost != "" {
+		host = splitHost
+	}
+	if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		host = host[1 : len(host)-1]
+	}
+	if idx := strings.IndexByte(host, '%'); idx >= 0 {
+		host = host[:idx]
+	}
+	if net.ParseIP(host) != nil {
+		return ""
+	}
+	host = strings.TrimSuffix(host, ".")
+	if host == "" {
+		return ""
+	}
+	for i := 0; i < len(host); i++ {
+		if host[i] >= 0x80 {
+			if ascii, errASCII := idna.Lookup.ToASCII(host); errASCII == nil && ascii != "" {
+				return ascii
+			}
+			break
+		}
+	}
+	return host
+}
+
+func buildAntigravityHTTPSProxyDialTLSContext(
+	httpsProxyAddrs *sync.Map,
+	proxyBaseTLS *tls.Config,
+	directTLS *tls.Config,
+	handshakeTimeout time.Duration,
+	baseDialContext func(ctx context.Context, network, addr string) (net.Conn, error),
+) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	dialContext := baseDialContext
+	if dialContext == nil {
+		dialContext = (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext
+	}
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		rawConn, errDial := dialContext(ctx, network, addr)
+		if errDial != nil {
+			return nil, errDial
+		}
+		var proxyHostname string
+		isHTTPSProxy := false
+		if httpsProxyAddrs != nil {
+			if rawHost, ok := httpsProxyAddrs.Load(addr); ok {
+				isHTTPSProxy = true
+				proxyHostname, _ = rawHost.(string)
+			}
+		}
+
+		var tlsConfig *tls.Config
+		if isHTTPSProxy {
+			if proxyBaseTLS != nil {
+				tlsConfig = proxyBaseTLS.Clone()
+			} else {
+				tlsConfig = &tls.Config{}
+			}
+			if tlsConfig.ServerName == "" {
+				if proxyHostname != "" {
+					tlsConfig.ServerName = antigravityTLSServerName(proxyHostname)
+				} else if host, _, errSplit := net.SplitHostPort(addr); errSplit == nil && host != "" {
+					tlsConfig.ServerName = antigravityTLSServerName(host)
+				}
+			}
+			tlsConfig.NextProtos = []string{"http/1.1"}
+		} else {
+			if directTLS != nil {
+				tlsConfig = directTLS.Clone()
+			} else {
+				tlsConfig = &tls.Config{NextProtos: []string{"h2", "http/1.1"}}
+			}
+			if tlsConfig.ServerName == "" {
+				if host, _, errSplit := net.SplitHostPort(addr); errSplit == nil && host != "" {
+					tlsConfig.ServerName = antigravityTLSServerName(host)
+				} else {
+					tlsConfig.ServerName = antigravityTLSServerName(addr)
+				}
+			}
+		}
+
+		tlsConn := tls.Client(rawConn, tlsConfig)
+		handshakeCtx := ctx
+		if handshakeTimeout > 0 {
+			var cancel context.CancelFunc
+			handshakeCtx, cancel = context.WithTimeout(ctx, handshakeTimeout)
+			defer cancel()
+		}
+		if errHandshake := tlsConn.HandshakeContext(handshakeCtx); errHandshake != nil {
+			_ = rawConn.Close()
+			if isHTTPSProxy {
+				return nil, fmt.Errorf("HTTPS proxy TLS handshake failed: %w", errHandshake)
+			}
+			return nil, errHandshake
+		}
+		return tlsConn, nil
+	}
 }
 
 // applyAntigravityPoolLimits configures connection pool parameters for Antigravity.
@@ -323,7 +523,10 @@ func applyAntigravityPoolLimits(transport *http.Transport, cfgs ...*config.Confi
 	if settings.shortMode {
 		transport.MaxIdleConnsPerHost = -1
 		transport.DisableKeepAlives = false
-		transport.IdleConnTimeout = 0
+		// Go's HTTP/1.1 pool closes immediately when MaxIdleConnsPerHost < 0, while
+		// bundled HTTP/2 ignores MaxIdleConnsPerHost and treats IdleConnTimeout == 0
+		// as infinite; a short positive timeout ensures idle h2 connections expire too.
+		transport.IdleConnTimeout = antigravityShortModeHTTP2IdleTimeout
 		return
 	}
 
@@ -360,129 +563,6 @@ func applyAntigravityPoolLimits(transport *http.Transport, cfgs ...*config.Confi
 	}
 }
 
-// cloneTransportWithHTTP2 clones base while keeping HTTP/2 over ALPN, which is what the
-// Antigravity CLI negotiates. The base transport is taken verbatim apart from the pool limits.
-func cloneTransportWithHTTP2(base *http.Transport, cfgs ...*config.Config) *http.Transport {
-	if base == nil {
-		return nil
-	}
-
-	clone := base.Clone()
-	clone.ForceAttemptHTTP2 = true
-	// A nil TLSNextProto lets net/http register the bundled HTTP/2 transport.
-	clone.TLSNextProto = nil
-	if clone.TLSClientConfig != nil {
-		tlsConfig := clone.TLSClientConfig.Clone()
-		// An explicit NextProtos on the base would pin the protocol list, so advertise the
-		// same ALPN set a Go HTTP/2 client uses by default.
-		tlsConfig.NextProtos = []string{"h2", "http/1.1"}
-		clone.TLSClientConfig = tlsConfig
-	}
-	applyAntigravityPoolLimits(clone, cfgs...)
-	return clone
-}
-
-// antigravityUpstreamTransport returns the credential-scoped pool matching the configured
-// upstream protocol: HTTP/2 over ALPN by default, HTTP/1.1 when antigravity.http2 is disabled.
-func antigravityUpstreamTransport(auth *cliproxyauth.Auth, base *http.Transport, cfgs ...*config.Config) *http.Transport {
-	if antigravityHTTP2Enabled(cfgs...) {
-		return antigravityHTTP2Transport(auth, base, cfgs...)
-	}
-	return antigravityHTTP11Transport(auth, base, cfgs...)
-}
-
-// antigravityProxiedUpstreamTransport is antigravityProxiedHTTP11Transport for the configured
-// upstream protocol, or nil when the proxy setting cannot be turned into a transport.
-func antigravityProxiedUpstreamTransport(auth *cliproxyauth.Auth, proxyURL string, cfgs ...*config.Config) *http.Transport {
-	if antigravityHTTP2Enabled(cfgs...) {
-		return antigravityProxiedHTTP2Transport(auth, proxyURL, cfgs...)
-	}
-	return antigravityProxiedHTTP11Transport(auth, proxyURL, cfgs...)
-}
-
-// antigravityHTTP2Transport returns the HTTP/2 pool shared by every request that uses the same
-// credential, base transport and proxy setting.
-func antigravityHTTP2Transport(auth *cliproxyauth.Auth, base *http.Transport, cfgs ...*config.Config) *http.Transport {
-	if base == nil {
-		return nil
-	}
-	transport, errGet := antigravityTransports.Get(antigravityTransportKeyFrom(auth, base, "", true, cfgs...), func() (*http.Transport, error) {
-		return cloneTransportWithHTTP2(base, cfgs...), nil
-	})
-	if errGet != nil {
-		// Defensive only: the builder above cannot fail. Never return nil here, because a
-		// nil Transport makes http.Client fall back to http.DefaultTransport.
-		log.Debugf("antigravity executor: cache HTTP/2 transport failed: %v", errGet)
-		return cloneTransportWithHTTP2(base, cfgs...)
-	}
-	return transport
-}
-
-// antigravityProxiedHTTP2Transport returns the credential-scoped HTTP/2 pool for one proxy
-// setting, or nil when the proxy setting cannot be turned into a transport.
-func antigravityProxiedHTTP2Transport(auth *cliproxyauth.Auth, proxyURL string, cfgs ...*config.Config) *http.Transport {
-	proxyURL = strings.TrimSpace(proxyURL)
-	if proxyURL == "" {
-		return nil
-	}
-	transport, errGet := antigravityTransports.Get(antigravityTransportKeyFrom(auth, nil, proxyURL, true, cfgs...), func() (*http.Transport, error) {
-		base, _, errBuild := proxyutil.BuildHTTPTransport(proxyURL)
-		if errBuild != nil {
-			return nil, errBuild
-		}
-		if base == nil {
-			return nil, fmt.Errorf("antigravity executor: proxy setting produced no transport")
-		}
-		return cloneTransportWithHTTP2(base, cfgs...), nil
-	})
-	if errGet != nil {
-		// The caller falls back to NewProxyAwareHTTPClient, which reports the failure and
-		// applies the context transport fallback.
-		return nil
-	}
-	return transport
-}
-
-// antigravityTransportKeyFrom builds the pool cache key of one credential, base transport and
-// proxy setting under the configured protocol and pool limits.
-func antigravityTransportKeyFrom(auth *cliproxyauth.Auth, base *http.Transport, proxy string, http2 bool, cfgs ...*config.Config) antigravityTransportKey {
-	var cfg *config.Config
-	if len(cfgs) > 0 {
-		cfg = cfgs[0]
-	}
-	settings := resolveAntigravityPoolSettings(cfg)
-	return antigravityTransportKey{
-		credential:          antigravityTransportScope(auth),
-		proxy:               proxy,
-		base:                base,
-		shortMode:           settings.shortMode,
-		idleConnTimeout:     settings.idleConnTimeout,
-		maxIdleConnsPerHost: settings.maxIdleConnsPerHost,
-		http2:               http2,
-	}
-}
-
-// antigravityHTTP2Enabled reports the configured upstream protocol; HTTP/2 is the default
-// because the Antigravity CLI speaks HTTP/2.
-func antigravityHTTP2Enabled(cfgs ...*config.Config) bool {
-	for _, cfg := range cfgs {
-		if cfg != nil {
-			return !cfg.Antigravity.DisableHTTP2
-		}
-	}
-	return true
-}
-
-// antigravityControlPlaneEnabled reports whether the CLI companion calls are mirrored.
-func antigravityControlPlaneEnabled(cfgs ...*config.Config) bool {
-	for _, cfg := range cfgs {
-		if cfg != nil {
-			return !cfg.Antigravity.DisableControlPlane
-		}
-	}
-	return true
-}
-
 // antigravityHTTP11Transport returns the HTTP/1.1 pool shared by every request that
 // uses the same credential and the same base transport. The base is either the
 // process default or a transport provided through the request context.
@@ -490,13 +570,25 @@ func antigravityHTTP11Transport(auth *cliproxyauth.Auth, base *http.Transport, c
 	if base == nil {
 		return nil
 	}
-	transport, errGet := antigravityTransports.Get(antigravityTransportKeyFrom(auth, base, "", false, cfgs...), func() (*http.Transport, error) {
+	var cfg *config.Config
+	if len(cfgs) > 0 {
+		cfg = cfgs[0]
+	}
+	settings := resolveAntigravityPoolSettings(cfg)
+	key := antigravityTransportKey{
+		credential:          antigravityTransportScope(auth),
+		base:                base,
+		shortMode:           settings.shortMode,
+		idleConnTimeout:     settings.idleConnTimeout,
+		maxIdleConnsPerHost: settings.maxIdleConnsPerHost,
+	}
+	transport, errGet := antigravityTransports.Get(key, func() (*http.Transport, error) {
 		return cloneTransportWithHTTP11(base, cfgs...), nil
 	})
 	if errGet != nil {
 		// Defensive only: the builder above cannot fail. Never return nil here, because a
 		// nil Transport makes http.Client fall back to http.DefaultTransport, which
-		// advertises h2 over ALPN and would break the Antigravity wire fingerprint.
+		// carries the untuned connection pool of the whole process.
 		log.Debugf("antigravity executor: cache HTTP/1.1 transport failed: %v", errGet)
 		return cloneTransportWithHTTP11(base, cfgs...)
 	}
@@ -512,7 +604,19 @@ func antigravityProxiedHTTP11Transport(auth *cliproxyauth.Auth, proxyURL string,
 	if proxyURL == "" {
 		return nil
 	}
-	transport, errGet := antigravityTransports.Get(antigravityTransportKeyFrom(auth, nil, proxyURL, false, cfgs...), func() (*http.Transport, error) {
+	var cfg *config.Config
+	if len(cfgs) > 0 {
+		cfg = cfgs[0]
+	}
+	settings := resolveAntigravityPoolSettings(cfg)
+	key := antigravityTransportKey{
+		credential:          antigravityTransportScope(auth),
+		proxy:               proxyURL,
+		shortMode:           settings.shortMode,
+		idleConnTimeout:     settings.idleConnTimeout,
+		maxIdleConnsPerHost: settings.maxIdleConnsPerHost,
+	}
+	transport, errGet := antigravityTransports.Get(key, func() (*http.Transport, error) {
 		base, _, errBuild := proxyutil.BuildHTTPTransport(proxyURL)
 		if errBuild != nil {
 			return nil, errBuild
@@ -587,7 +691,7 @@ func newAntigravityHTTPClient(ctx context.Context, cfg *config.Config, auth *cli
 	// credential-scoped proxy transport only here so other providers keep their
 	// existing lifecycle and different OAuth identities remain isolated.
 	if proxyURL := antigravityProxyURL(ctx, cfg, auth); proxyURL != "" {
-		if transport := antigravityProxiedUpstreamTransport(auth, proxyURL, cfg); transport != nil {
+		if transport := antigravityProxiedHTTP11Transport(auth, proxyURL, cfg); transport != nil {
 			return &http.Client{Transport: transport, Timeout: timeout}
 		}
 		// Fall through so NewProxyAwareHTTPClient reports the failure and applies the
@@ -595,14 +699,14 @@ func newAntigravityHTTPClient(ctx context.Context, cfg *config.Config, auth *cli
 	}
 
 	client := helps.NewProxyAwareHTTPClient(httptransport.WithoutDecorator(ctx), cfg, auth, timeout)
-	// Direct requests share an upstream pool only within the selected credential.
+	// Direct requests share an HTTP/1.1 pool only within the selected credential.
 	if client.Transport == nil {
-		client.Transport = antigravityUpstreamTransport(auth, antigravityBaseTransport, cfg)
+		client.Transport = antigravityHTTP11Transport(auth, antigravityBaseTransport, cfg)
 		return client
 	}
 
-	// Preserve a context-provided transport while applying the configured protocol. The
-	// cache key includes credential identity, so sharing the base does not share TLS pools.
+	// Preserve a context-provided transport while forcing HTTP/1.1. The cache key
+	// includes credential identity, so sharing the base does not share TLS pools.
 	transport, ok := client.Transport.(*http.Transport)
 	if !ok {
 		// A RoundTripper that is not an *http.Transport owns its own protocol behavior.
@@ -615,7 +719,7 @@ func newAntigravityHTTPClient(ctx context.Context, cfg *config.Config, auth *cli
 		// Antigravity fingerprint, so substitute the process base transport.
 		transport = antigravityBaseTransport
 	}
-	client.Transport = antigravityUpstreamTransport(auth, transport, cfg)
+	client.Transport = antigravityHTTP11Transport(auth, transport, cfg)
 	return client
 }
 

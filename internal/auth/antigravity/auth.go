@@ -53,23 +53,42 @@ func (e *HTTPStatusError) StatusCode() int {
 // AntigravityAuth handles Antigravity OAuth authentication
 type AntigravityAuth struct {
 	httpClient *http.Client
+	pkce       *PKCECodes
 }
 
 // NewAntigravityAuth creates a new Antigravity auth service.
 func NewAntigravityAuth(cfg *config.Config, httpClient *http.Client) *AntigravityAuth {
+	return newAntigravityAuth(cfg, httpClient, nil)
+}
+
+// NewAntigravityAuthWithPKCE creates an auth service that sends the RFC 7636
+// challenge on the authorization URL and the matching verifier on the code
+// exchange, like the official client. The service must outlive the consent step,
+// so callers that build the URL and exchange the code in separate calls pass the
+// same codes to both.
+func NewAntigravityAuthWithPKCE(cfg *config.Config, httpClient *http.Client, codes *PKCECodes) *AntigravityAuth {
+	return newAntigravityAuth(cfg, httpClient, codes)
+}
+
+func newAntigravityAuth(cfg *config.Config, httpClient *http.Client, codes *PKCECodes) *AntigravityAuth {
 	if cfg == nil {
 		cfg = &config.Config{}
 	}
 	if httpClient != nil {
-		return &AntigravityAuth{httpClient: httpClient}
+		return &AntigravityAuth{httpClient: httpClient, pkce: codes}
 	}
 	return &AntigravityAuth{
 		httpClient: util.SetProxy(&cfg.SDKConfig, &http.Client{}),
+		pkce:       codes,
 	}
 }
 
 func (o *AntigravityAuth) shortUserAgent() string {
 	return misc.AntigravityRequestUserAgent("")
+}
+
+func (o *AntigravityAuth) nodeUserAgent() string {
+	return misc.AntigravityOnboardUserUserAgent("")
 }
 
 func antigravityLoadCodeAssistMetadata() map[string]string {
@@ -137,7 +156,7 @@ func defaultAntigravityTierID(loadResp map[string]any) string {
 // BuildAuthURL generates the OAuth authorization URL.
 func (o *AntigravityAuth) BuildAuthURL(state, redirectURI string) string {
 	if strings.TrimSpace(redirectURI) == "" {
-		redirectURI = fmt.Sprintf("http://localhost:%d/oauth-callback", CallbackPort)
+		redirectURI = fmt.Sprintf("http://localhost:%d%s", CallbackPort, CallbackPath)
 	}
 	params := url.Values{}
 	params.Set("access_type", "offline")
@@ -147,17 +166,27 @@ func (o *AntigravityAuth) BuildAuthURL(state, redirectURI string) string {
 	params.Set("response_type", "code")
 	params.Set("scope", strings.Join(Scopes, " "))
 	params.Set("state", state)
+	if o != nil && o.pkce != nil && strings.TrimSpace(o.pkce.Challenge) != "" {
+		params.Set("code_challenge", o.pkce.Challenge)
+		params.Set("code_challenge_method", "S256")
+	}
 	return AuthEndpoint + "?" + params.Encode()
 }
 
 // ExchangeCodeForTokens exchanges authorization code for access and refresh tokens
 func (o *AntigravityAuth) ExchangeCodeForTokens(ctx context.Context, code, redirectURI string) (*TokenResponse, error) {
+	if strings.TrimSpace(redirectURI) == "" {
+		redirectURI = fmt.Sprintf("http://localhost:%d%s", CallbackPort, CallbackPath)
+	}
 	data := url.Values{}
 	data.Set("code", code)
 	data.Set("client_id", ClientID)
 	data.Set("client_secret", ClientSecret)
 	data.Set("redirect_uri", redirectURI)
 	data.Set("grant_type", "authorization_code")
+	if o != nil && o.pkce != nil && strings.TrimSpace(o.pkce.Verifier) != "" {
+		data.Set("code_verifier", o.pkce.Verifier)
+	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, TokenEndpoint, strings.NewReader(data.Encode()))
 	if err != nil {
@@ -308,7 +337,7 @@ func (o *AntigravityAuth) FetchProjectID(ctx context.Context, accessToken string
 // OnboardUser attempts to fetch the project ID via onboardUser by polling for completion
 func (o *AntigravityAuth) OnboardUser(ctx context.Context, accessToken, tierID string) (string, error) {
 	log.Infof("Antigravity: onboarding user with tier: %s", tierID)
-	userAgent := o.shortUserAgent()
+	userAgent := o.nodeUserAgent()
 	requestBody := map[string]any{
 		"tier_id":  tierID,
 		"metadata": antigravityControlPlaneMetadata(userAgent),
@@ -337,8 +366,10 @@ func (o *AntigravityAuth) OnboardUser(ctx context.Context, accessToken, tierID s
 			return "", fmt.Errorf("create request: %w", errRequest)
 		}
 		req.Header.Set("Authorization", "Bearer "+accessToken)
+		req.Header.Set("Accept", "*/*")
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("User-Agent", userAgent)
+		req.Header.Set("X-Goog-Api-Client", misc.AntigravityGoogAPIClientUA)
 
 		resp, errDo := o.httpClient.Do(req)
 		if errDo != nil {

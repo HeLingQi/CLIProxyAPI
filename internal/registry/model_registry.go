@@ -85,10 +85,11 @@ type ModelInfo struct {
 	// SupportsWebSearch indicates this Antigravity model is listed by
 	// fetchAvailableModels.webSearchModelIds and can execute native googleSearch.
 	SupportsWebSearch bool `json:"supports_web_search,omitempty"`
-	// ModelEnum is the internal model identifier the Antigravity account catalog reports for
-	// this model, for example MODEL_PLACEHOLDER_M318. The CLI echoes it as a request label and
-	// in the trajectory report, so it stays internal and is never listed.
-	ModelEnum string `json:"-"`
+	// AntigravityModelEnum is the upstream model enum reported by
+	// fetchAvailableModels as models.<id>.model. The official client echoes it in
+	// request.labels.model_enum on every agent request. Internal only: it must
+	// never appear in model-list responses.
+	AntigravityModelEnum string `json:"-"`
 
 	// SupportConfigurationUpdate reports internal support for configuration_update.
 	SupportConfigurationUpdate bool `json:"-"`
@@ -2229,4 +2230,41 @@ func (r *ModelRegistry) ClientRegistrationEpoch(clientID string) uint64 {
 func (r *ModelRegistry) GetModelsForClient(clientID string) []*ModelInfo {
 	models, _ := r.GetModelsAndEpochForClient(clientID)
 	return models
+}
+
+// AvailableProviderModel identifies one currently available model and its runtime provider.
+type AvailableProviderModel struct {
+	Provider string
+	Model    string
+}
+
+// GetAvailableProviderModels returns de-duplicated provider/model pairs for active clients.
+func (r *ModelRegistry) GetAvailableProviderModels() []AvailableProviderModel {
+	if r == nil {
+		return nil
+	}
+	r.mutex.RLock()
+	providers := make(map[string]struct{}, len(r.clientProviders))
+	for _, provider := range r.clientProviders {
+		provider = strings.ToLower(strings.TrimSpace(provider))
+		if provider != "" {
+			providers[provider] = struct{}{}
+		}
+	}
+	r.mutex.RUnlock()
+	result := make([]AvailableProviderModel, 0)
+	for provider := range providers {
+		for _, model := range r.GetAvailableModelsByProvider(provider) {
+			if model != nil && strings.TrimSpace(model.ID) != "" {
+				result = append(result, AvailableProviderModel{Provider: provider, Model: strings.TrimSpace(model.ID)})
+			}
+		}
+	}
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].Provider != result[j].Provider {
+			return result[i].Provider < result[j].Provider
+		}
+		return result[i].Model < result[j].Model
+	})
+	return result
 }

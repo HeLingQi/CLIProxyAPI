@@ -6,6 +6,7 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const usdPerMillionScale int64 = 1_000_000
@@ -106,6 +107,8 @@ type ModelConfig struct {
 	Provider   string     `json:"provider"`
 	Model      string     `json:"model"`
 	BasePrices BasePrices `json:"base_prices"`
+	Expression string     `json:"expression,omitempty"`
+	Source     string     `json:"source,omitempty"`
 }
 
 // State is one immutable pricing catalog revision.
@@ -123,7 +126,15 @@ type Subject struct {
 	UncachedInput   int64
 	CacheReadInput  int64
 	CacheWriteInput int64
+	CacheWrite1h    int64
+	CacheWrite12h   int64
 	Output          int64
+	AudioInput      int64
+	AudioOutput     int64
+	InputLength     int64
+	ImageCount      int64
+	Thinking        bool
+	At              time.Time
 }
 
 // Quote is a fixed-point catalog estimate for one request.
@@ -132,4 +143,6 @@ type Quote struct {
 	USDMicros int64
 	Revision  int64
 	Model     string
+	Tier      string
+	Source    string
 }

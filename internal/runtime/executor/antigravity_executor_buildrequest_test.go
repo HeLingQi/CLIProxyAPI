@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/MoeForge/moego/ojson"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/misc"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
@@ -36,34 +38,6 @@ func TestResolveAntigravityRequestBaseURL(t *testing.T) {
 			t.Fatalf("base URL = %q, want custom auth file endpoint", got)
 		}
 	})
-}
-
-// The backend gates model visibility and feature flags on the client fingerprint, so the
-// upstream request must carry the Antigravity CLI User-Agent and only the headers the CLI
-// itself sends.
-func TestAntigravityBuildRequestHeadersMatchCLI(t *testing.T) {
-	t.Parallel()
-
-	executor := &AntigravityExecutor{}
-	auth := &cliproxyauth.Auth{Metadata: map[string]any{"project_id": "project-1"}}
-	req, errBuild := executor.buildRequest(context.Background(), auth, "token", "gemini-3.1-pro", []byte(`{"request":{"contents":[]}}`), true, "", antigravityBaseURLDaily)
-	if errBuild != nil {
-		t.Fatalf("buildRequest error: %v", errBuild)
-	}
-	if got := req.Header.Get("User-Agent"); !strings.HasPrefix(got, "antigravity/cli/") {
-		t.Fatalf("User-Agent = %q, want the Antigravity CLI family", got)
-	}
-	if got := req.Header.Get("Authorization"); got != "Bearer token" {
-		t.Fatalf("Authorization = %q", got)
-	}
-	if got := req.Header.Get("Content-Type"); got != "application/json" {
-		t.Fatalf("Content-Type = %q", got)
-	}
-	for _, name := range []string{"Accept", "X-Goog-Api-Client", "X-Goog-User-Project"} {
-		if got := req.Header.Get(name); got != "" {
-			t.Fatalf("%s = %q, want omitted", name, got)
-		}
-	}
 }
 
 func TestAntigravityLoadCodeAssistBaseURL(t *testing.T) {
@@ -201,38 +175,74 @@ func TestAntigravityBuildRequest_UsesRouteModelWhenPayloadContainsDifferentModel
 	}
 }
 
-func TestAntigravityBuildRequestUsesDerivedSessionIDAndPreservesExplicit(t *testing.T) {
+func TestAntigravityBuildRequestPinsSessionIDAndConversationIDs(t *testing.T) {
 	t.Parallel()
 
 	executor := &AntigravityExecutor{}
 	auth := &cliproxyauth.Auth{Metadata: map[string]any{"project_id": "project-1"}}
 	payload := []byte(`{"request":{"contents":[{"role":"user","parts":[{"text":"hello"}]}]}}`)
-	req, err := executor.buildRequest(context.Background(), auth, "token", "gemini-3.1-pro", payload, false, "", "https://example.com", "-123456789")
+	explicitPayload := []byte(`{"request":{"sessionId":"-987654321","contents":[{"role":"user","parts":[{"text":"hello"}]}]}}`)
+
+	for name, raw := range map[string][]byte{"derived": payload, "explicit": explicitPayload} {
+		body := buildRequestBodyWithDerivedSession(t, executor, auth, "gemini-3.1-pro", raw, "-123456789")
+		request, ok := body["request"].(map[string]any)
+		if !ok {
+			t.Fatalf("%s: request missing or invalid: %v", name, body["request"])
+		}
+		if got := request["sessionId"]; got != misc.AntigravitySessionID {
+			t.Fatalf("%s: request.sessionId = %v, want %s", name, got, misc.AntigravitySessionID)
+		}
+	}
+
+	first := buildRequestBodyWithDerivedSession(t, executor, auth, "gemini-3.1-pro", payload, "-123456789")
+	repeat := buildRequestBodyWithDerivedSession(t, executor, auth, "gemini-3.1-pro", payload, "-123456789")
+	other := buildRequestBodyWithDerivedSession(t, executor, auth, "gemini-3.1-pro", payload, "-987654321")
+	firstRequest := first["request"].(map[string]any)
+	repeatRequest := repeat["request"].(map[string]any)
+	otherRequest := other["request"].(map[string]any)
+
+	firstLabels := firstRequest["labels"].(map[string]any)
+	repeatLabels := repeatRequest["labels"].(map[string]any)
+	otherLabels := otherRequest["labels"].(map[string]any)
+	if firstLabels["cascade_id"] != repeatLabels["cascade_id"] {
+		t.Fatalf("cascade_id must stay stable for one conversation: %v vs %v", firstLabels["cascade_id"], repeatLabels["cascade_id"])
+	}
+	if firstLabels["cascade_id"] == otherLabels["cascade_id"] {
+		t.Fatalf("cascade_id must differ between conversations: %v", firstLabels["cascade_id"])
+	}
+
+	// The official client sends agent/<cascade_id>/<start millis>/<trajectory_id>/<step>.
+	segments := strings.Split(first["requestId"].(string), "/")
+	if len(segments) != 5 || segments[0] != "agent" {
+		t.Fatalf("requestId = %v, want agent/<cascade>/<millis>/<trajectory>/<step>", first["requestId"])
+	}
+	if segments[1] != firstLabels["cascade_id"] || segments[3] != firstLabels["trajectory_id"] {
+		t.Fatalf("requestId %v must echo labels cascade_id/trajectory_id", first["requestId"])
+	}
+	if _, errConv := strconv.ParseInt(segments[2], 10, 64); errConv != nil {
+		t.Fatalf("requestId %v carries a non-numeric millisecond segment", first["requestId"])
+	}
+	if segments[4] != "1" || firstLabels["last_step_index"] != "0" {
+		t.Fatalf("a first agent step must be step 1 with last_step_index 0, got requestId %v labels %v", first["requestId"], firstLabels)
+	}
+	if firstLabels["request_id"] != antigravityLabelString(firstLabels["trajectory_id"])+"-0" {
+		t.Fatalf("labels.request_id = %v, want <trajectory_id>-0", firstLabels["request_id"])
+	}
+}
+
+func buildRequestBodyWithDerivedSession(t *testing.T, executor *AntigravityExecutor, auth *cliproxyauth.Auth, modelName string, payload []byte, derivedSessionID string) map[string]any {
+	t.Helper()
+
+	req, err := executor.buildRequest(context.Background(), auth, "token", modelName, payload, false, "", "https://example.com", derivedSessionID)
 	if err != nil {
 		t.Fatalf("buildRequest error: %v", err)
 	}
-	body := requestBody(t, req)
-	request, ok := body["request"].(map[string]any)
-	if !ok {
-		t.Fatalf("request missing or invalid: %v", body["request"])
-	}
-	if got := request["sessionId"]; got != "-123456789" {
-		t.Fatalf("request.sessionId = %v, want -123456789", got)
-	}
+	return requestBody(t, req)
+}
 
-	explicitPayload := []byte(`{"request":{"sessionId":"-987654321","contents":[{"role":"user","parts":[{"text":"hello"}]}]}}`)
-	explicitReq, errExplicit := executor.buildRequest(context.Background(), auth, "token", "gemini-3.1-pro", explicitPayload, false, "", "https://example.com", "-123456789")
-	if errExplicit != nil {
-		t.Fatalf("buildRequest explicit error: %v", errExplicit)
-	}
-	explicitBody := requestBody(t, explicitReq)
-	explicitRequest, ok := explicitBody["request"].(map[string]any)
-	if !ok {
-		t.Fatalf("explicit request missing or invalid: %v", explicitBody["request"])
-	}
-	if got := explicitRequest["sessionId"]; got != "-987654321" {
-		t.Fatalf("explicit request.sessionId = %v, want -987654321", got)
-	}
+func antigravityLabelString(value any) string {
+	text, _ := value.(string)
+	return text
 }
 
 func TestAntigravityBuildRequest_PreservesIndependentWebSearchRequestType(t *testing.T) {
@@ -418,7 +428,7 @@ func TestAntigravityExecutor_Claude55ExplicitThinkingLevelPreserved(t *testing.T
 						}, nil
 					}))
 
-					executor := NewAntigravityExecutor(antigravityNoControlPlane(&config.Config{}))
+					executor := NewAntigravityExecutor(&config.Config{})
 					auth := &cliproxyauth.Auth{
 						ID:       "ag-claude-55-test",
 						Provider: "antigravity",

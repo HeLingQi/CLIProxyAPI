@@ -222,7 +222,7 @@ func enableAntigravityResponsesThinkingSummary(inputRawJSON, translated []byte) 
 		return translated
 	}
 	effortVal := strings.ToLower(strings.TrimSpace(effort.String()))
-	if effortVal == "" || effortVal == "none" {
+	if effortVal == "" || effortVal == "none" || effortVal == "disabled" || effortVal == "persistent" {
 		return translated
 	}
 	summaryConfig := thinking.ExtractSummaryConfig(inputRawJSON, "openai-response")

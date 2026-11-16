@@ -2,14 +2,21 @@ package executor
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -41,16 +48,6 @@ func antigravityAuthWithIDAndProxy(id, proxyURL string) *cliproxyauth.Auth {
 // TestNewAntigravityHTTPClientSharesTransport is the regression test for the bug where
 // every proxied Antigravity request created a new transport, so no keep-alive connection
 // was ever reused and every request paid a full TCP + TLS handshake.
-// antigravityPinnedHTTP11 pins the upstream protocol to HTTP/1.1 so tests can keep asserting the
-// HTTP/1.1 wire profile now that HTTP/2 over ALPN is the Antigravity default.
-func antigravityPinnedHTTP11(cfg *config.Config) *config.Config {
-	if cfg == nil {
-		cfg = &config.Config{}
-	}
-	cfg.Antigravity.DisableHTTP2 = true
-	return cfg
-}
-
 func TestNewAntigravityHTTPClientSharesTransport(t *testing.T) {
 	enabled := true
 	poolCfg := func(sdkCfg ...config.SDKConfig) *config.Config {
@@ -64,7 +61,7 @@ func TestNewAntigravityHTTPClientSharesTransport(t *testing.T) {
 		if len(sdkCfg) > 0 {
 			cfg.SDKConfig = sdkCfg[0]
 		}
-		return antigravityPinnedHTTP11(cfg)
+		return cfg
 	}
 
 	cases := []struct {
@@ -95,17 +92,17 @@ func TestNewAntigravityHTTPClientSharesTransport(t *testing.T) {
 			if !ok {
 				t.Fatalf("expected *http.Transport, got %T", first.Transport)
 			}
-			if transport.ForceAttemptHTTP2 {
-				t.Fatal("Antigravity transport must not attempt HTTP/2")
+			if !transport.ForceAttemptHTTP2 {
+				t.Fatal("Antigravity transport must attempt HTTP/2, like the official ALPN offer")
 			}
-			if len(transport.TLSNextProto) != 0 {
-				t.Fatal("Antigravity transport must not allow an implicit HTTP/2 upgrade")
+			if transport.TLSNextProto != nil {
+				t.Fatal("Antigravity transport must leave the bundled HTTP/2 implementation in charge of ALPN h2")
 			}
 			if transport.TLSClientConfig == nil {
 				t.Fatal("Antigravity transport must carry an explicit TLS config")
 			}
-			if len(transport.TLSClientConfig.NextProtos) != 0 {
-				t.Fatalf("Antigravity must omit ALPN like the native client, got %v", transport.TLSClientConfig.NextProtos)
+			if got := transport.TLSClientConfig.NextProtos; len(got) != 2 || got[0] != "h2" || got[1] != "http/1.1" {
+				t.Fatalf("Antigravity must offer the official ALPN list, got %v", got)
 			}
 			// Native Antigravity uses DefaultMaxIdleConnsPerHost of 2.
 			if transport.MaxIdleConnsPerHost < antigravityDefaultMaxIdleConnsPerHost {
@@ -198,17 +195,17 @@ func TestAntigravityPoolLimitsGuardsDefaultAndGFECutoff(t *testing.T) {
 func TestNewAntigravityHTTPClientRejectsTypedNilContextTransport(t *testing.T) {
 	var typedNil *http.Transport
 	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", http.RoundTripper(typedNil))
-	client := newAntigravityHTTPClient(ctx, antigravityPinnedHTTP11(&config.Config{}), antigravityAuthWithIDAndProxy("typed-nil", ""), 0)
+	client := newAntigravityHTTPClient(ctx, &config.Config{}, antigravityAuthWithIDAndProxy("typed-nil", ""), 0)
 
 	transport, ok := client.Transport.(*http.Transport)
 	if !ok || transport == nil {
 		t.Fatalf("expected a usable *http.Transport, got %#v", client.Transport)
 	}
-	if transport.ForceAttemptHTTP2 {
-		t.Fatal("fallback transport must not attempt HTTP/2")
+	if !transport.ForceAttemptHTTP2 {
+		t.Fatal("fallback transport must attempt HTTP/2, like the official ALPN offer")
 	}
-	if len(transport.TLSClientConfig.NextProtos) != 0 {
-		t.Fatalf("fallback transport must omit ALPN, got %v", transport.TLSClientConfig.NextProtos)
+	if got := transport.TLSClientConfig.NextProtos; len(got) != 2 || got[0] != "h2" || got[1] != "http/1.1" {
+		t.Fatalf("fallback transport must offer the official ALPN list, got %v", got)
 	}
 }
 
@@ -647,8 +644,8 @@ func TestAntigravityTransportMatchesNativeTLSProfile(t *testing.T) {
 		t.Fatalf("close response body: %v", errClose)
 	}
 
-	if len(clientHelloProtos) != 0 {
-		t.Fatalf("ClientHello ALPN = %v, want no ALPN extension", clientHelloProtos)
+	if len(clientHelloProtos) != 2 || clientHelloProtos[0] != "h2" || clientHelloProtos[1] != "http/1.1" {
+		t.Fatalf("ClientHello ALPN = %v, want [h2 http/1.1]", clientHelloProtos)
 	}
 	if requestProto != "HTTP/1.1" {
 		t.Fatalf("request protocol = %q, want HTTP/1.1", requestProto)
@@ -656,53 +653,8 @@ func TestAntigravityTransportMatchesNativeTLSProfile(t *testing.T) {
 	if tlsVersion != tls.VersionTLS13 {
 		t.Fatalf("TLS version = %#x, want TLS 1.3", tlsVersion)
 	}
-	if negotiatedProtocol != "" {
-		t.Fatalf("negotiated ALPN = %q, want empty", negotiatedProtocol)
-	}
-}
-
-// TestAntigravityTransportNegotiatesHTTP2ByDefault proves that the upstream default follows the
-// Antigravity CLI, which speaks HTTP/2 negotiated over ALPN.
-func TestAntigravityTransportNegotiatesHTTP2ByDefault(t *testing.T) {
-	var requestProto string
-	var clientHelloProtos []string
-	var negotiatedProtocol string
-
-	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requestProto = r.Proto
-		if r.TLS != nil {
-			negotiatedProtocol = r.TLS.NegotiatedProtocol
-		}
-		w.WriteHeader(http.StatusNoContent)
-	}))
-	server.EnableHTTP2 = true
-	server.TLS = &tls.Config{
-		MinVersion: tls.VersionTLS13,
-		NextProtos: []string{"h2", "http/1.1"},
-		GetConfigForClient: func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
-			clientHelloProtos = append([]string(nil), hello.SupportedProtos...)
-			return nil, nil
-		},
-	}
-	server.StartTLS()
-	defer server.Close()
-
-	base := http.DefaultTransport.(*http.Transport).Clone()
-	base.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
-	transport := antigravityUpstreamTransport(antigravityAuthWithIDAndProxy("default-http2", ""), base, &config.Config{})
-	resp, errDo := (&http.Client{Transport: transport}).Get(server.URL)
-	if errDo != nil {
-		t.Fatalf("GET() error = %v", errDo)
-	}
-	if errClose := resp.Body.Close(); errClose != nil {
-		t.Fatalf("close response body: %v", errClose)
-	}
-
-	if requestProto != "HTTP/2.0" {
-		t.Fatalf("request protocol = %q, want HTTP/2.0 for the Antigravity CLI profile (ALPN %v)", requestProto, clientHelloProtos)
-	}
-	if negotiatedProtocol != "h2" {
-		t.Fatalf("negotiated ALPN = %q, want h2", negotiatedProtocol)
+	if negotiatedProtocol == "h2" {
+		t.Fatalf("negotiated ALPN = %q, want the request to stay on HTTP/1.1 while the frontend declines h2", negotiatedProtocol)
 	}
 }
 
@@ -975,7 +927,7 @@ func TestAntigravityShortModeNeverAdvertisesConnectionCloseAndDisconnects(t *tes
 // closeAntigravityAuthIdleTransports cleans up cached transports for that auth.
 func TestCloseAntigravityAuthIdleTransportsEvictsIdlePool(t *testing.T) {
 	auth := antigravityAuthWithIDAndProxy("auth-to-close", "")
-	cfg := antigravityPinnedHTTP11(&config.Config{})
+	cfg := &config.Config{}
 
 	client := newAntigravityHTTPClient(context.Background(), cfg, auth, 0)
 	if client.Transport == nil {
@@ -1028,14 +980,14 @@ func TestAntigravityCountTokens429EvictsIdleTransports(t *testing.T) {
 	}
 
 	enabledPool := true
-	cfg := antigravityPinnedHTTP11(&config.Config{
+	cfg := &config.Config{
 		Antigravity: config.AntigravityConfig{
 			ConnectionPool: config.AntigravityConnectionPoolConfig{
 				Enabled: &enabledPool,
 			},
 		},
-	})
-	exec := NewAntigravityExecutor(antigravityNoControlPlane(cfg))
+	}
+	exec := NewAntigravityExecutor(cfg)
 
 	// Build client to populate cache
 	client := newAntigravityHTTPClient(context.Background(), cfg, auth, 0)
@@ -1104,5 +1056,130 @@ func TestAntigravityTransportKeySeparatesPoolSettingsAcrossReload(t *testing.T) 
 	}
 	if trPooled.MaxIdleConnsPerHost != antigravityDefaultMaxIdleConnsPerHost {
 		t.Fatalf("pooled transport MaxIdleConnsPerHost = %d, want %d", trPooled.MaxIdleConnsPerHost, antigravityDefaultMaxIdleConnsPerHost)
+	}
+}
+
+func TestCloneTransportWithHTTP11ConfiguresHTTP2HealthChecksAndHTTPSProxyGuard(t *testing.T) {
+	proxyURL, errParse := url.Parse("https://proxy.example.internal:8443")
+	if errParse != nil {
+		t.Fatal(errParse)
+	}
+	base := &http.Transport{
+		Proxy: http.ProxyURL(proxyURL),
+	}
+	cloned := cloneTransportWithHTTP11(base)
+	if cloned.TLSNextProto != nil {
+		t.Fatal("TLSNextProto must stay nil so bundled HTTP/2 remains active")
+	}
+	if cloned.HTTP2 == nil || cloned.HTTP2.SendPingTimeout != antigravityHTTP2SendPingTimeout || cloned.HTTP2.PingTimeout != antigravityHTTP2PingTimeout {
+		t.Fatalf("HTTP2 health check timeouts = %#v, want SendPingTimeout=%v PingTimeout=%v", cloned.HTTP2, antigravityHTTP2SendPingTimeout, antigravityHTTP2PingTimeout)
+	}
+	if cloned.DialTLSContext == nil {
+		t.Fatal("expected DialTLSContext guard when Transport.Proxy points to an https:// proxy")
+	}
+
+	directCloned := cloneTransportWithHTTP11(&http.Transport{})
+	if directCloned.DialTLSContext != nil {
+		t.Fatal("direct transport without https:// proxy must keep DialTLSContext nil")
+	}
+}
+
+func TestCloneTransportWithHTTP11PreservesDirectTLSOnNoProxyAndGuardsHTTPSProxy(t *testing.T) {
+	priv, errKey := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if errKey != nil {
+		t.Fatal(errKey)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+	}
+	certDER, errCert := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &priv.PublicKey, priv)
+	if errCert != nil {
+		t.Fatal(errCert)
+	}
+	serverCert := tls.Certificate{Certificate: [][]byte{certDER}, PrivateKey: priv}
+
+	type observedHello struct {
+		serverName string
+		protos     []string
+	}
+	var mu sync.Mutex
+	hellos := map[string]observedHello{}
+
+	proxyURL, errParse := url.Parse("https://corp-proxy.internal:8443")
+	if errParse != nil {
+		t.Fatal(errParse)
+	}
+
+	base := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		// Simulate HTTPS_PROXY=https://corp-proxy.internal:8443 alongside NO_PROXY=*.googleapis.com:
+		// googleapis.com hosts bypass the proxy (return nil), while other hosts use the https:// proxy.
+		Proxy: func(req *http.Request) (*url.URL, error) {
+			if strings.HasSuffix(req.URL.Hostname(), ".googleapis.com") {
+				return nil, nil
+			}
+			return proxyURL, nil
+		},
+		DialContext: func(_ context.Context, _, addr string) (net.Conn, error) {
+			clientConn, serverConn := net.Pipe()
+			go func() {
+				defer serverConn.Close()
+				tlsSrv := tls.Server(serverConn, &tls.Config{
+					Certificates: []tls.Certificate{serverCert},
+					NextProtos:   []string{"h2", "http/1.1"},
+					GetConfigForClient: func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
+						mu.Lock()
+						hellos[addr] = observedHello{
+							serverName: hello.ServerName,
+							protos:     append([]string(nil), hello.SupportedProtos...),
+						}
+						mu.Unlock()
+						return nil, nil
+					},
+				})
+				_ = tlsSrv.Handshake()
+			}()
+			return clientConn, nil
+		},
+	}
+
+	cloned := cloneTransportWithHTTP11(base)
+	if cloned.DialTLSContext == nil {
+		t.Fatal("expected DialTLSContext guard even when NO_PROXY bypasses *.googleapis.com")
+	}
+
+	// 1. Dialing the HTTPS proxy outer socket must advertise only http/1.1 and SNI corp-proxy.internal.
+	proxyConn, errDialProxy := cloned.DialTLSContext(context.Background(), "tcp", "corp-proxy.internal:8443")
+	if errDialProxy != nil {
+		t.Fatalf("DialTLSContext(proxy) error = %v", errDialProxy)
+	}
+	_ = proxyConn.Close()
+
+	// 2. Dialing a NO_PROXY direct destination must preserve official ALPN [h2 http/1.1] and target SNI!
+	directConn, errDialDirect := cloned.DialTLSContext(context.Background(), "tcp", "daily-cloudcode-pa.googleapis.com:443")
+	if errDialDirect != nil {
+		t.Fatalf("DialTLSContext(direct NO_PROXY target) error = %v", errDialDirect)
+	}
+	_ = directConn.Close()
+
+	mu.Lock()
+	proxyHello := hellos["corp-proxy.internal:8443"]
+	directHello := hellos["daily-cloudcode-pa.googleapis.com:443"]
+	mu.Unlock()
+
+	if proxyHello.serverName != "corp-proxy.internal" {
+		t.Fatalf("proxy SNI = %q, want corp-proxy.internal", proxyHello.serverName)
+	}
+	if len(proxyHello.protos) != 1 || proxyHello.protos[0] != "http/1.1" {
+		t.Fatalf("proxy ALPN = %v, want [http/1.1]", proxyHello.protos)
+	}
+
+	if directHello.serverName != "daily-cloudcode-pa.googleapis.com" {
+		t.Fatalf("direct NO_PROXY SNI = %q, want daily-cloudcode-pa.googleapis.com", directHello.serverName)
+	}
+	if len(directHello.protos) != 2 || directHello.protos[0] != "h2" || directHello.protos[1] != "http/1.1" {
+		t.Fatalf("direct NO_PROXY ALPN = %v, want [h2 http/1.1]", directHello.protos)
 	}
 }

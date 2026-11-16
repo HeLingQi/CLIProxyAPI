@@ -45,6 +45,7 @@ func (s *Server) registerManagementV8Routes() {
 	v8.GET("/observability/usage/events", s.mgmt.GetUsageHistoryEvents)
 	v8.GET("/observability/pricing/models", s.mgmt.GetPricingModels)
 	v8.PUT("/observability/pricing/models", s.mgmt.PutPricingModel)
+	v8.POST("/observability/pricing/models/sync", s.mgmt.SyncPricingModels)
 	v8.DELETE("/observability/pricing/models", s.mgmt.DeletePricingModel)
 
 	v8.GET("/credentials", s.mgmt.ListAuthFiles)

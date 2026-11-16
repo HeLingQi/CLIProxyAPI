@@ -17,6 +17,7 @@ import (
 	"github.com/MoeForge/moego/ojson"
 	internalcache "github.com/router-for-me/CLIProxyAPI/v8/internal/cache"
 	homekv "github.com/router-for-me/CLIProxyAPI/v8/internal/home"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	internalsignature "github.com/router-for-me/CLIProxyAPI/v8/internal/signature"
 	translatorcommon "github.com/router-for-me/CLIProxyAPI/v8/internal/translator/common"
@@ -164,9 +165,24 @@ func antigravityReasoningReplayScopeFromRequest(ctx context.Context, modelName s
 	// Prefer an explicit downstream session over a provider sessionId synthesized
 	// from request text. This keeps identical prompts in separate client sessions
 	// from sharing an opaque Gemini reasoning chain.
-	scope := antigravityReasoningReplayScope{modelName: modelName}
+	scope := antigravityReasoningReplayScope{modelName: strings.TrimSpace(modelName)}
 	if sessionKey := antigravityReasoningReplayClientSessionKey(ctx, req, opts); sessionKey != "" {
 		scope.sessionKey = sessionKey
+	} else if explicitOrigID := antigravityReplaySessionIDFromPayload(opts.OriginalRequest); explicitOrigID != "" {
+		scope = antigravityReasoningReplayScope{
+			modelName:  strings.TrimSpace(modelName),
+			sessionKey: "session:" + explicitOrigID,
+		}
+	} else if explicitReqID := antigravityReplaySessionIDFromPayload(req.Payload); explicitReqID != "" {
+		scope = antigravityReasoningReplayScope{
+			modelName:  strings.TrimSpace(modelName),
+			sessionKey: "session:" + explicitReqID,
+		}
+	} else if explicitPayloadID := antigravityReplaySessionIDFromPayload(payload); explicitPayloadID != "" {
+		scope = antigravityReasoningReplayScope{
+			modelName:  strings.TrimSpace(modelName),
+			sessionKey: "session:" + explicitPayloadID,
+		}
 	} else {
 		scope = antigravityReasoningReplayScopeFromPayload(modelName, payload)
 		if !scope.valid() {
@@ -194,9 +210,24 @@ func antigravityReasoningReplayScopeFromRequestDoc(ctx context.Context, modelNam
 	if antigravityRequestIsSymmetricForReasoningReplay(opts) && !antigravityDocHasClaudeToolProvenanceID(doc) {
 		return antigravityReasoningReplayScope{}
 	}
-	scope := antigravityReasoningReplayScope{modelName: modelName}
+	scope := antigravityReasoningReplayScope{modelName: strings.TrimSpace(modelName)}
 	if sessionKey := antigravityReasoningReplayClientSessionKey(ctx, req, opts); sessionKey != "" {
 		scope.sessionKey = sessionKey
+	} else if explicitOrigID := antigravityReplaySessionIDFromPayload(opts.OriginalRequest); explicitOrigID != "" {
+		scope = antigravityReasoningReplayScope{
+			modelName:  strings.TrimSpace(modelName),
+			sessionKey: "session:" + explicitOrigID,
+		}
+	} else if explicitReqID := antigravityReplaySessionIDFromPayload(req.Payload); explicitReqID != "" {
+		scope = antigravityReasoningReplayScope{
+			modelName:  strings.TrimSpace(modelName),
+			sessionKey: "session:" + explicitReqID,
+		}
+	} else if explicitDocID := antigravityReplaySessionIDFromDoc(doc); explicitDocID != "" {
+		scope = antigravityReasoningReplayScope{
+			modelName:  strings.TrimSpace(modelName),
+			sessionKey: "session:" + explicitDocID,
+		}
 	} else {
 		scope = antigravityReasoningReplayScopeFromDoc(modelName, doc)
 		if !scope.valid() {
@@ -327,9 +358,11 @@ func antigravityReplaySessionIDFromPayload(payload []byte) string {
 	if len(payload) == 0 {
 		return ""
 	}
-	for _, path := range []string{"sessionId", "session_id", "request.sessionId", "request.session_id"} {
+	for _, path := range []string{"sessionId", "session_id", "request.sessionId", "request.session_id", "request.labels.cascade_id"} {
 		if id := strings.TrimSpace(ojson.GetBytesNoCopy(payload, path).String()); id != "" {
-			return strings.Clone(id)
+			if resolved := antigravityReplaySessionID(id); resolved != "" {
+				return resolved
+			}
 		}
 	}
 	return ""
@@ -339,12 +372,25 @@ func antigravityReplaySessionIDFromDoc(doc *ojson.Doc) string {
 	if doc == nil {
 		return ""
 	}
-	for _, path := range []string{"sessionId", "session_id", "request.sessionId", "request.session_id"} {
+	for _, path := range []string{"sessionId", "session_id", "request.sessionId", "request.session_id", "request.labels.cascade_id"} {
 		if id := strings.TrimSpace(doc.Get(path).String()); id != "" {
-			return strings.Clone(id)
+			if resolved := antigravityReplaySessionID(id); resolved != "" {
+				return resolved
+			}
 		}
 	}
 	return ""
+}
+
+// antigravityReplaySessionID rejects the client-wide constant sessionId that
+// every official Antigravity request carries. It identifies the client, not a
+// conversation, so using it as a replay key would share one conversation's
+// reasoning chain with every other conversation.
+func antigravityReplaySessionID(id string) string {
+	if id == misc.AntigravitySessionID {
+		return ""
+	}
+	return strings.Clone(id)
 }
 
 func antigravityReasoningReplayResolveContentIndex(payload []byte, cached int) int {

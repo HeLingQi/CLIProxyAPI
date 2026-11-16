@@ -85,8 +85,8 @@ type antigravityModelCapabilityHints struct {
 	WebSearchModelIDs map[string]struct{}
 	// Nil means unknown; an empty non-nil set is an authoritative empty catalog.
 	ModelIDs map[string]struct{}
-	// ModelEnums maps model ID to the internal model identifier the Antigravity CLI
-	// echoes back as the request_labels.model_enum field; nil means unknown.
+	// ModelEnums maps a model ID to the upstream model enum used in
+	// request.labels.model_enum.
 	ModelEnums map[string]string
 	revision   uint64
 }
@@ -221,8 +221,8 @@ func (s *Service) persistAntigravityCapabilityHints(ctx context.Context, auth *c
 func buildPersistedAntigravityCapabilityHintsValue(project, endpoint string, hints antigravityModelCapabilityHints) map[string]any {
 	return sdkauth.BuildPersistedAntigravityCapabilityHints(project, endpoint, sdkauth.AntigravityModelCapabilityHints{
 		ModelIDs:          hints.ModelIDs,
-		ModelEnums:        hints.ModelEnums,
 		WebSearchModelIDs: hints.WebSearchModelIDs,
+		ModelEnums:        hints.ModelEnums,
 	})
 }
 
@@ -233,8 +233,8 @@ func parsePersistedAntigravityCapabilityHints(metadata map[string]any, expectedP
 	}
 	return antigravityModelCapabilityHints{
 		ModelIDs:          hints.ModelIDs,
-		ModelEnums:        hints.ModelEnums,
 		WebSearchModelIDs: hints.WebSearchModelIDs,
+		ModelEnums:        hints.ModelEnums,
 	}, true
 }
 
@@ -342,8 +342,13 @@ func (s *Service) fetchAntigravityModelCapabilityHints(ctx context.Context, auth
 		// successful catalog. Preserve last success and increase the jittered backoff.
 		antigravityAuthFailureCache[failureKey] = nextAntigravityFailure(antigravityAuthFailureCache[failureKey], now, rand.Int64N)
 		retained := current.hints.clone()
-		if status == antigravityProbeStatusSuccess && len(hints.WebSearchModelIDs) > 0 {
-			retained.WebSearchModelIDs = hints.WebSearchModelIDs
+		if status == antigravityProbeStatusSuccess {
+			if len(hints.WebSearchModelIDs) > 0 {
+				retained.WebSearchModelIDs = hints.WebSearchModelIDs
+			}
+			if len(hints.ModelEnums) > 0 {
+				retained.ModelEnums = maps.Clone(hints.ModelEnums)
+			}
 		}
 		return retained, nil
 	})
@@ -374,8 +379,8 @@ func (s *Service) probeAntigravityModelCapabilityHints(ctx context.Context, auth
 	})
 	return antigravityModelCapabilityHints{
 		ModelIDs:          hints.ModelIDs,
-		ModelEnums:        hints.ModelEnums,
 		WebSearchModelIDs: hints.WebSearchModelIDs,
+		ModelEnums:        hints.ModelEnums,
 	}, status
 }
 
@@ -443,8 +448,8 @@ func parseAntigravityModelCapabilityHints(body []byte) (antigravityModelCapabili
 	}
 	return antigravityModelCapabilityHints{
 		ModelIDs:          hints.ModelIDs,
-		ModelEnums:        hints.ModelEnums,
 		WebSearchModelIDs: hints.WebSearchModelIDs,
+		ModelEnums:        hints.ModelEnums,
 	}, true
 }
 
@@ -461,8 +466,8 @@ func applyAntigravityFetchedModelCapabilities(models []*ModelInfo, hints antigra
 		if _, ok := hints.WebSearchModelIDs[modelID]; ok {
 			model.SupportsWebSearch = true
 		}
-		if enum, ok := hints.ModelEnums[modelID]; ok {
-			model.ModelEnum = enum
+		if enum, ok := hints.ModelEnums[modelID]; ok && enum != "" {
+			model.AntigravityModelEnum = enum
 		}
 	}
 	return models
@@ -560,7 +565,7 @@ func (s *Service) applyAntigravityModelHints(ctx context.Context, auth *coreauth
 	if ctx.Err() != nil || s.antigravityHomeEnabled() || s.antigravityCapabilityKey(auth) != expectedKey {
 		return
 	}
-	if hints.ModelIDs == nil && len(hints.WebSearchModelIDs) == 0 {
+	if hints.ModelIDs == nil && len(hints.WebSearchModelIDs) == 0 && len(hints.ModelEnums) == 0 {
 		return
 	}
 	if s.coreManager != nil {
@@ -598,8 +603,12 @@ func (s *Service) applyAntigravityModelHints(ctx context.Context, auth *coreauth
 		// Older capability-only responses cannot revoke model entitlements.
 		aliasMap := s.buildAntigravityReverseAliasMap(auth)
 		updated = GlobalModelRegistry().ApplyClientModelCapabilities(auth.ID, expectedRegEpoch, func(id string, info *ModelInfo) {
-			if _, ok := hints.WebSearchModelIDs[resolveAntigravityUpstreamModelID(id, auth.Prefix, aliasMap)]; ok {
+			upstreamID := resolveAntigravityUpstreamModelID(id, auth.Prefix, aliasMap)
+			if _, ok := hints.WebSearchModelIDs[upstreamID]; ok {
 				info.SupportsWebSearch = true
+			}
+			if enum, ok := hints.ModelEnums[upstreamID]; ok && enum != "" {
+				info.AntigravityModelEnum = enum
 			}
 		})
 	}

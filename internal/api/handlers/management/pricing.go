@@ -8,12 +8,17 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/pricing"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	log "github.com/sirupsen/logrus"
 )
 
 type pricingModelWriteRequest struct {
 	Revision int64 `json:"revision"`
 	pricing.ModelConfig
+}
+
+type pricingSyncRequest struct {
+	Revision int64 `json:"revision"`
 }
 
 // GetPricingModels returns the active immutable pricing catalog revision.
@@ -49,6 +54,37 @@ func (h *Handler) PutPricingModel(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, state)
+}
+
+// SyncPricingModels imports BaseLLM expressions for currently available provider/model pairs.
+func (h *Handler) SyncPricingModels(c *gin.Context) {
+	catalog := h.currentPricingCatalog()
+	if catalog == nil {
+		writePricingError(c, http.StatusServiceUnavailable, "pricing_unavailable", "Pricing catalog is unavailable")
+		return
+	}
+	var request pricingSyncRequest
+	if errBind := c.ShouldBindJSON(&request); errBind != nil || request.Revision < 0 {
+		writePricingError(c, http.StatusBadRequest, "invalid_revision", "Pricing revision must be a non-negative integer")
+		return
+	}
+	available := registry.GetGlobalRegistry().GetAvailableProviderModels()
+	targets := make([]pricing.SyncTarget, 0, len(available))
+	for _, model := range available {
+		targets = append(targets, pricing.SyncTarget{Provider: model.Provider, Model: model.Model})
+	}
+	models, summary, errLoad := pricing.LoadBaseLLMModels(c.Request.Context(), http.DefaultClient, targets)
+	if errLoad != nil {
+		log.WithError(errLoad).Warn("pricing source sync failed")
+		writePricingError(c, http.StatusBadGateway, "pricing_sync_failed", "Failed to synchronize model pricing")
+		return
+	}
+	state, errUpsert := catalog.UpsertMany(c.Request.Context(), request.Revision, models)
+	if errUpsert != nil {
+		writePricingCatalogError(c, errUpsert)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"revision": state.Revision, "models": state.Models, "sync": summary})
 }
 
 // DeletePricingModel removes one provider/model configuration at an expected revision.

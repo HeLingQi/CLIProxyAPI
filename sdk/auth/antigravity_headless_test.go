@@ -2,6 +2,8 @@ package auth_test
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"io"
 	"net/http"
 	"net/url"
@@ -22,7 +24,7 @@ func TestAntigravityConstantsAndURLBuilder(t *testing.T) {
 		t.Fatalf("expected callback port 51121, got %d", auth.AntigravityDefaultCallbackPort)
 	}
 
-	expectedDefaultURI := "http://localhost:51121/oauth-callback"
+	expectedDefaultURI := "http://localhost:51121/auth/callback"
 	if got := auth.AntigravityDefaultCallbackURI(); got != expectedDefaultURI {
 		t.Fatalf("expected default callback URI %q, got %q", expectedDefaultURI, got)
 	}
@@ -53,6 +55,12 @@ func TestAntigravityConstantsAndURLBuilder(t *testing.T) {
 	if !strings.Contains(q.Get("scope"), "cloud-platform") {
 		t.Fatalf("scope should include cloud-platform: %s", q.Get("scope"))
 	}
+	if q.Get("code_challenge") != "" || q.Get("code_challenge_method") != "" {
+		t.Fatalf("the PKCE-free URL builder must not advertise a challenge it cannot verify: %s", authURL)
+	}
+	if got := q.Get("scope"); !strings.HasSuffix(got, " https://www.googleapis.com/auth/aicode") {
+		t.Fatalf("scope must keep the official order with aicode last, got %q", got)
+	}
 
 	// Test with empty redirect URI (should fallback to default)
 	authURLDefault := auth.BuildAntigravityAuthURL("state-456", "")
@@ -65,10 +73,54 @@ func TestAntigravityConstantsAndURLBuilder(t *testing.T) {
 	}
 }
 
+func TestAntigravityAuthURLAndExchangeUsePKCE(t *testing.T) {
+	codes, errCodes := auth.NewAntigravityPKCECodes()
+	if errCodes != nil {
+		t.Fatalf("NewAntigravityPKCECodes error: %v", errCodes)
+	}
+	sum := sha256.Sum256([]byte(codes.Verifier))
+	if want := base64.RawURLEncoding.EncodeToString(sum[:]); codes.Challenge != want {
+		t.Fatalf("challenge = %q, want BASE64URL(SHA256(verifier)) %q", codes.Challenge, want)
+	}
+
+	authURL := auth.BuildAntigravityAuthURLWithPKCE("state-pkce", "http://localhost:8123/auth/callback", codes)
+	parsed, errParse := url.Parse(authURL)
+	if errParse != nil {
+		t.Fatalf("failed to parse auth URL: %v", errParse)
+	}
+	q := parsed.Query()
+	if q.Get("code_challenge") != codes.Challenge {
+		t.Fatalf("code_challenge = %q, want %q", q.Get("code_challenge"), codes.Challenge)
+	}
+	if q.Get("code_challenge_method") != "S256" {
+		t.Fatalf("code_challenge_method = %q, want S256", q.Get("code_challenge_method"))
+	}
+
+	var capturedBody string
+	client := &http.Client{
+		Transport: mockRoundTripper(func(req *http.Request) (*http.Response, error) {
+			body, _ := io.ReadAll(req.Body)
+			capturedBody = string(body)
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body: io.NopCloser(strings.NewReader(
+					`{"access_token":"mock-access-token","refresh_token":"mock-refresh-token","expires_in":3600,"token_type":"Bearer"}`)),
+			}, nil
+		}),
+	}
+	if _, errExchange := auth.ExchangeAntigravityCodeWithPKCE(context.Background(), "auth-code-123", "http://localhost:8123/auth/callback", codes, client); errExchange != nil {
+		t.Fatalf("ExchangeAntigravityCodeWithPKCE error: %v", errExchange)
+	}
+	if !strings.Contains(capturedBody, "code_verifier="+url.QueryEscape(codes.Verifier)) {
+		t.Fatalf("token exchange must present the verifier, got %s", capturedBody)
+	}
+}
+
 func TestAntigravityUserAgent(t *testing.T) {
 	ua := auth.AntigravityUserAgent()
-	if !strings.HasPrefix(ua, "antigravity/cli/") {
-		t.Fatalf("expected AntigravityUserAgent to start with antigravity/cli/, got %q", ua)
+	if !strings.HasPrefix(ua, "antigravity/hub/") {
+		t.Fatalf("expected AntigravityUserAgent to start with antigravity/hub/, got %q", ua)
 	}
 }
 

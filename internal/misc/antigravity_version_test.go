@@ -1,110 +1,47 @@
 package misc
 
 import (
-	"context"
 	"fmt"
-	"net/http"
-	"net/http/httptest"
-	"strconv"
-	"strings"
 	"testing"
-	"time"
 )
 
-func overrideAntigravityVersionURLsForTest(t *testing.T, cliManifestURL string) func() {
-	t.Helper()
-
-	oldCLIManifest := antigravityCLILatestManifestURL
-	antigravityCLILatestManifestURL = cliManifestURL
-
-	return func() {
-		antigravityCLILatestManifestURL = oldCLIManifest
+func TestAntigravityPinnedVersionIsReported(t *testing.T) {
+	if got := AntigravityLatestVersion(); got != antigravityPinnedVersion {
+		t.Fatalf("AntigravityLatestVersion() = %q, want %q", got, antigravityPinnedVersion)
+	}
+	if got := AntigravityChangelist(); got != antigravityPinnedChangelist {
+		t.Fatalf("AntigravityChangelist() = %q, want %q", got, antigravityPinnedChangelist)
 	}
 }
 
-func overrideAntigravityVersionCacheForTest(t *testing.T, client antigravityClientInfo, expiry time.Time) func() {
-	t.Helper()
-
-	antigravityVersionMu.Lock()
-	oldClient := cachedAntigravityClient
-	oldExpiry := antigravityVersionExpiry
-	cachedAntigravityClient = client
-	antigravityVersionExpiry = expiry
-	antigravityVersionMu.Unlock()
-
-	return func() {
-		antigravityVersionMu.Lock()
-		cachedAntigravityClient = oldClient
-		antigravityVersionExpiry = oldExpiry
-		antigravityVersionMu.Unlock()
-	}
-}
-
-func TestAntigravityLatestVersionUsesCurrentCLIFallback(t *testing.T) {
-	restore := overrideAntigravityVersionCacheForTest(t, antigravityClientInfo{}, time.Time{})
-	defer restore()
-
-	version := AntigravityLatestVersion()
-	if version != antigravityCLIFallbackVersion {
-		t.Fatalf("AntigravityLatestVersion() = %q, want %q", version, antigravityCLIFallbackVersion)
-	}
-}
-
-// The backend hides the gemini-3.8-flash family from CLI clients below 1.2.0, so the
-// offline fallback must stay at or above that release.
-func TestAntigravityFallbackVersionMeetsBackendFloor(t *testing.T) {
-	const floorMajor, floorMinor = 1, 2
+// Cloud Code resolves newer models only for clients reporting at least 2.23.0;
+// older versions get 404 Requested entity was not found.
+func TestAntigravityPinnedVersionMeetsBackendFloor(t *testing.T) {
+	const floorMajor, floorMinor = 2, 23
 
 	var major, minor, patch int
-	if _, err := fmt.Sscanf(antigravityCLIFallbackVersion, "%d.%d.%d", &major, &minor, &patch); err != nil {
-		t.Fatalf("antigravityCLIFallbackVersion = %q is not a dotted version: %v", antigravityCLIFallbackVersion, err)
+	if _, err := fmt.Sscanf(antigravityPinnedVersion, "%d.%d.%d", &major, &minor, &patch); err != nil {
+		t.Fatalf("antigravityPinnedVersion = %q is not a dotted version: %v", antigravityPinnedVersion, err)
 	}
 	if major < floorMajor || (major == floorMajor && minor < floorMinor) {
-		t.Fatalf("antigravityCLIFallbackVersion = %q, want at least %d.%d.0", antigravityCLIFallbackVersion, floorMajor, floorMinor)
+		t.Fatalf("antigravityPinnedVersion = %q, want at least %d.%d.0", antigravityPinnedVersion, floorMajor, floorMinor)
 	}
 }
 
-// Changelists at or below 1013060670 hide the swarm orchestrator and worker models.
-func TestAntigravityFallbackChangelistMeetsBackendFloor(t *testing.T) {
-	const floor = 1017000000
-
-	changelist, errParse := strconv.ParseInt(antigravityCLIFallbackChangelist, 10, 64)
-	if errParse != nil {
-		t.Fatalf("antigravityCLIFallbackChangelist = %q is not a number: %v", antigravityCLIFallbackChangelist, errParse)
-	}
-	if changelist < floor {
-		t.Fatalf("antigravityCLIFallbackChangelist = %q, want at least %d", antigravityCLIFallbackChangelist, floor)
+func TestAntigravityUserAgentUsesHubFamily(t *testing.T) {
+	want := "antigravity/hub/2.31.2 (aidev_client; os_type=darwin; arch=arm64; cl=1019359392)"
+	if got := AntigravityUserAgent(); got != want {
+		t.Fatalf("AntigravityUserAgent() = %q, want %q", got, want)
 	}
 }
 
-func TestAntigravityUserAgentUsesCLIFamily(t *testing.T) {
-	for _, tc := range []struct {
-		name   string
-		client antigravityClientInfo
-		want   string
-	}{
-		{"fallback", antigravityClientInfo{antigravityCLIFallbackVersion, antigravityCLIFallbackChangelist}, "antigravity/cli/1.5.7 (aidev_client; os_type=linux; arch=amd64; cl=1019769835; auth_method=consumer)"},
-		{"manifest build id", antigravityClientInfo{"1.6.0", "6190022064472064"}, "antigravity/cli/1.6.0 (aidev_client; os_type=linux; arch=amd64; cl=6190022064472064; auth_method=consumer)"},
-		{"unknown changelist", antigravityClientInfo{"1.6.0", ""}, "antigravity/cli/1.6.0 (aidev_client; os_type=linux; arch=amd64; auth_method=consumer)"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			restore := overrideAntigravityVersionCacheForTest(t, tc.client, time.Now().Add(time.Hour))
-			defer restore()
-			if got := AntigravityUserAgent(); got != tc.want {
-				t.Fatalf("AntigravityUserAgent() = %q, want %q", got, tc.want)
-			}
-		})
-	}
-}
-
-func TestAntigravityVersionFromUserAgentParsesCLIFamily(t *testing.T) {
-	for _, userAgent := range []string{
-		"antigravity/cli/1.5.7 linux/amd64",
-		"antigravity/cli/1.5.7 (aidev_client; os_type=linux; arch=amd64; cl=1019769835; auth_method=consumer)",
-	} {
-		if got := AntigravityVersionFromUserAgent(userAgent); got != "1.5.7" {
-			t.Fatalf("AntigravityVersionFromUserAgent(%q) = %q, want %q", userAgent, got, "1.5.7")
-		}
+func TestAntigravitySessionIDIsSignedFNV1A64OfEmptyInput(t *testing.T) {
+	// The official client hashes no input at all, so the value is fixed by the
+	// hash parameters: offset basis 0xcbf29ce484222325 read as a signed int64.
+	offsetBasis := uint64(0xcbf29ce484222325)
+	want := fmt.Sprintf("%d", int64(offsetBasis))
+	if AntigravitySessionID != want {
+		t.Fatalf("AntigravitySessionID = %q, want %q", AntigravitySessionID, want)
 	}
 }
 
@@ -126,11 +63,14 @@ func TestAntigravityVersionFromUserAgentParsesLegacyFamily(t *testing.T) {
 	}
 }
 
-func TestAntigravityLoadCodeAssistUserAgentUsesShortUA(t *testing.T) {
-	restore := overrideAntigravityVersionCacheForTest(t, antigravityClientInfo{version: "1.5.7"}, time.Now().Add(time.Hour))
-	defer restore()
+func TestAntigravityVersionFromUserAgentFallsBackToPinnedVersion(t *testing.T) {
+	if got := AntigravityVersionFromUserAgent("claude-cli/1.0.0"); got != antigravityPinnedVersion {
+		t.Fatalf("AntigravityVersionFromUserAgent() = %q, want %q", got, antigravityPinnedVersion)
+	}
+}
 
-	want := "antigravity/cli/1.5.7 (aidev_client; os_type=linux; arch=amd64; auth_method=consumer)"
+func TestAntigravityLoadCodeAssistUserAgentUsesShortUA(t *testing.T) {
+	want := "antigravity/hub/2.31.2 (aidev_client; os_type=darwin; arch=arm64; cl=1019359392)"
 	if got := AntigravityLoadCodeAssistUserAgent(""); got != want {
 		t.Fatalf("AntigravityLoadCodeAssistUserAgent() = %q, want %q", got, want)
 	}
@@ -139,82 +79,55 @@ func TestAntigravityLoadCodeAssistUserAgentUsesShortUA(t *testing.T) {
 	}
 }
 
-// antigravityCLITestReleaseURL mirrors the archive layout of the live manifest, where
-// the changelist trails the version in the directory before the platform segment.
-func antigravityCLITestReleaseURL(version, changelist string) string {
-	return fmt.Sprintf("https://storage.googleapis.com/antigravity-public/antigravity-cli/%s-%s/linux-x64/cli_linux_x64.tar.gz", version, changelist)
-}
-
-func TestFetchAntigravityCLIClientInfoUsesManifest(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/manifests/linux_amd64.json":
-			// The CLI updater uses the plain Go client, so no UA override is sent.
-			if got := r.Header.Get("User-Agent"); !strings.HasPrefix(got, "Go-http-client/") {
-				t.Errorf("CLI manifest User-Agent = %q, want the Go client default", got)
-			}
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = fmt.Fprintf(w, `{"version":"1.6.0","url":%q,"sha512":"abc"}`, antigravityCLITestReleaseURL("1.6.0", "6190022064472064"))
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	defer server.Close()
-
-	restore := overrideAntigravityVersionURLsForTest(t, server.URL+"/manifests/linux_amd64.json")
-	defer restore()
-
-	client, errFetch := fetchAntigravityCLIClientInfo(context.Background())
-	if errFetch != nil {
-		t.Fatalf("fetchAntigravityCLIClientInfo() error = %v", errFetch)
-	}
-	if client.version != "1.6.0" || client.changelist != "6190022064472064" {
-		t.Fatalf("fetchAntigravityCLIClientInfo() = %+v, want version 1.6.0 and changelist 6190022064472064", client)
+func TestAntigravityOnboardUserUserAgentUsesLongUA(t *testing.T) {
+	want := "antigravity/hub/2.31.2 (aidev_client; os_type=darwin; arch=arm64; cl=1019359392) google-api-nodejs-client/10.3.0"
+	if got := AntigravityOnboardUserUserAgent(""); got != want {
+		t.Fatalf("AntigravityOnboardUserUserAgent() = %q, want %q", got, want)
 	}
 }
 
-func TestFetchAntigravityCLIClientInfoKeepsFloorWithoutArchiveURL(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"version":"1.6.0"}`))
-	}))
-	defer server.Close()
+func TestConfigureAntigravityPinnedIdentityAtomicOverride(t *testing.T) {
+	t.Cleanup(func() {
+		ConfigureAntigravityPinnedIdentity("", "")
+	})
 
-	restore := overrideAntigravityVersionURLsForTest(t, server.URL+"/manifests/linux_amd64.json")
-	defer restore()
-
-	client, errFetch := fetchAntigravityCLIClientInfo(context.Background())
-	if errFetch != nil {
-		t.Fatalf("fetchAntigravityCLIClientInfo() error = %v", errFetch)
+	if ConfigureAntigravityPinnedIdentity("2.35.0", "") {
+		t.Fatal("expected partial override without changelist to be rejected")
 	}
-	if client.changelist != antigravityCLIFallbackChangelist {
-		t.Fatalf("fetchAntigravityCLIClientInfo() changelist = %q, want %q", client.changelist, antigravityCLIFallbackChangelist)
+	if ConfigureAntigravityPinnedIdentity("2.35.0", "not-numeric") {
+		t.Fatal("expected non-numeric changelist to be rejected")
 	}
-}
-
-func TestFetchAntigravityCLIClientInfoRejectsInvalidVersion(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"version":"latest","url":"https://example.invalid/x"}`))
-	}))
-	defer server.Close()
-
-	restore := overrideAntigravityVersionURLsForTest(t, server.URL+"/manifests/linux_amd64.json")
-	defer restore()
-
-	if _, errFetch := fetchAntigravityCLIClientInfo(context.Background()); errFetch == nil {
-		t.Fatal("fetchAntigravityCLIClientInfo() error = nil, want error")
+	if got := AntigravityLatestVersion(); got != antigravityPinnedVersion {
+		t.Fatalf("version after rejected override = %q, want %q", got, antigravityPinnedVersion)
 	}
-}
 
-func TestFetchAntigravityCLIClientInfoReturnsManifestError(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "temporary outage", http.StatusInternalServerError)
-	}))
-	defer server.Close()
+	if !ConfigureAntigravityPinnedIdentity("2.35.0", "1099999999") {
+		t.Fatal("expected valid atomic pair override to succeed")
+	}
+	wantUA := "antigravity/hub/2.35.0 (aidev_client; os_type=darwin; arch=arm64; cl=1099999999)"
+	if got := AntigravityUserAgent(); got != wantUA {
+		t.Fatalf("AntigravityUserAgent() = %q, want %q", got, wantUA)
+	}
 
-	restore := overrideAntigravityVersionURLsForTest(t, server.URL+"/manifests/linux_amd64.json")
-	defer restore()
+	// A subsequent partial or malformed hot-reload must reset back to the built-in
+	// pinned pair rather than leaving the previous override stale.
+	if ConfigureAntigravityPinnedIdentity("2.36.0", "") {
+		t.Fatal("expected partial hot-reload override to return false")
+	}
+	if got := AntigravityLatestVersion(); got != antigravityPinnedVersion {
+		t.Fatalf("version after malformed hot-reload = %q, want built-in %q", got, antigravityPinnedVersion)
+	}
+	if got := AntigravityChangelist(); got != antigravityPinnedChangelist {
+		t.Fatalf("changelist after malformed hot-reload = %q, want built-in %q", got, antigravityPinnedChangelist)
+	}
 
-	if _, errFetch := fetchAntigravityCLIClientInfo(context.Background()); errFetch == nil {
-		t.Fatal("fetchAntigravityCLIClientInfo() error = nil, want error")
+	if !ConfigureAntigravityPinnedIdentity("2.35.0", "1099999999") {
+		t.Fatal("expected valid override after reset to succeed")
+	}
+	if !ConfigureAntigravityPinnedIdentity("", "") {
+		t.Fatal("expected empty override to reset back to built-in pin")
+	}
+	if got := AntigravityLatestVersion(); got != antigravityPinnedVersion {
+		t.Fatalf("version after reset = %q, want %q", got, antigravityPinnedVersion)
 	}
 }

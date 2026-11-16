@@ -3,6 +3,7 @@ package executor
 import (
 	"bytes"
 	"context"
+	"crypto/sha1"
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
@@ -64,21 +65,21 @@ func (e *AntigravityExecutor) buildRequestDoc(ctx context.Context, auth *cliprox
 	if errProject != nil {
 		return nil, nil, errProject
 	}
-	var agentCall *antigravityCallIdentity
-	agentCall = geminiToAntigravityDoc(doc, modelName, projectID, derivedSessionIDs...)
+	geminiToAntigravityDoc(doc, modelName, projectID, derivedSessionIDs...)
 	promptStructuredOutput := helps.PrepareAntigravityClaudeStructuredOutputDoc(modelName, doc)
 
-	// Cap maxOutputTokens to model's max_completion_tokens from registry
+	// Cap maxOutputTokens to model's output ceiling from registry
 	if maxOut := doc.Get("request.generationConfig.maxOutputTokens"); maxOut.Exists() && maxOut.Type == ojson.Number {
-		if modelInfo := registry.LookupModelInfo(modelName, "antigravity"); modelInfo != nil && modelInfo.MaxCompletionTokens > 0 {
-			if int(maxOut.Int()) > modelInfo.MaxCompletionTokens {
-				_ = doc.Set("request.generationConfig.maxOutputTokens", modelInfo.MaxCompletionTokens)
+		if maxCap := antigravityOutputCeiling(lookupAntigravityModelInfo(modelName)); maxCap > 0 {
+			if int(maxOut.Int()) > maxCap {
+				_ = doc.Set("request.generationConfig.maxOutputTokens", maxCap)
 			}
 		}
 	}
 
-	isClaudeModel := strings.Contains(modelName, "claude")
-	useAntigravitySchema := isClaudeModel || strings.Contains(modelName, "gemini-3-pro") || strings.Contains(modelName, "gemini-3.1-pro")
+	lowerModel := strings.ToLower(strings.TrimSpace(modelName))
+	isClaudeModel := strings.Contains(lowerModel, "claude")
+	useAntigravitySchema := isClaudeModel || strings.Contains(lowerModel, "gemini-3-pro") || strings.Contains(lowerModel, "gemini-3.1-pro")
 	if antigravityRequestNeedsSchemaSanitizationDoc(doc) {
 		sanitizeAntigravityRequestSchemasForModelDoc(doc, useAntigravitySchema, isClaudeModel)
 	}
@@ -86,9 +87,19 @@ func (e *AntigravityExecutor) buildRequestDoc(ctx context.Context, auth *cliprox
 		if !promptStructuredOutput {
 			_ = doc.Set("request.toolConfig.functionCallingConfig.mode", "VALIDATED")
 		}
+		if reqType := strings.ToLower(strings.TrimSpace(doc.Get("requestType").String())); reqType != "" && reqType != "agent" {
+			_ = doc.Delete("request.generationConfig.maxOutputTokens")
+		}
+		if doc.Get("request.generationConfig.thinkingConfig.thinkingLevel").Exists() {
+			_ = doc.Delete("request.generationConfig.thinkingConfig.thinkingBudget")
+			if !doc.Get("request.generationConfig.thinkingConfig.includeThoughts").Exists() {
+				_ = doc.Set("request.generationConfig.thinkingConfig.includeThoughts", true)
+			}
+		}
 	} else {
-		_ = doc.Delete("request.generationConfig.maxOutputTokens")
+		applyAntigravityGeminiGenerationShapeDoc(doc, modelName)
 	}
+	applyAntigravitySystemInstructionRoleDoc(doc)
 
 	applyAntigravityNativeSignatureReplayIfNeededDoc(modelName, doc)
 	helps.FinalizePayloadDoc(ctx, doc)
@@ -105,15 +116,10 @@ func (e *AntigravityExecutor) buildRequestDoc(ctx context.Context, auth *cliprox
 	if errReq != nil {
 		return nil, nil, errReq
 	}
-	if agentCall != nil {
-		// The trajectory report of this conversation has to reuse the identifiers the request
-		// advertised, so they travel with the request the caller already holds.
-		httpReq = httpReq.WithContext(withAntigravityCallIdentity(httpReq.Context(), *agentCall))
-	}
-	// Deliberately no httpReq.Close: the native Antigravity client omits the Connection
-	// header and keeps its connections alive, so forcing "Connection: close" would both
-	// deviate from that fingerprint and defeat the shared connection pool by discarding
-	// every established TCP + TLS session.
+	// Deliberately no httpReq.Close: the native Antigravity client omits the
+	// Connection header and keeps its HTTP/1.1 connections alive, so forcing
+	// "Connection: close" would both deviate from that fingerprint and defeat the
+	// shared connection pool by discarding every established TCP + TLS session.
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Authorization", "Bearer "+token)
 	httpReq.Header.Set("User-Agent", resolveUserAgent(auth))
@@ -727,14 +733,15 @@ func geminiToAntigravity(modelName string, payload []byte, projectID string, der
 	return doc.Bytes()
 }
 
-func geminiToAntigravityDoc(doc *ojson.Doc, modelName string, projectID string, derivedSessionIDs ...string) (agentCall *antigravityCallIdentity) {
+func geminiToAntigravityDoc(doc *ojson.Doc, modelName string, projectID string, derivedConversationIDs ...string) {
 	if doc == nil {
-		return nil
+		return
 	}
 	helps.SetStringIfDifferentDoc(doc, "model", modelName)
 	helps.SetStringIfDifferentDoc(doc, "userAgent", "antigravity")
 
-	isImageModel := strings.Contains(modelName, "image")
+	lowerModel := strings.ToLower(strings.TrimSpace(modelName))
+	isImageModel := strings.Contains(lowerModel, "image")
 	reqType := strings.TrimSpace(doc.Get("requestType").String())
 	if reqType == "" {
 		if isImageModel {
@@ -744,6 +751,7 @@ func geminiToAntigravityDoc(doc *ojson.Doc, modelName string, projectID string, 
 		}
 		_ = doc.Set("requestType", reqType)
 	}
+	normalizedReqType := strings.ToLower(reqType)
 
 	if projectID != "" {
 		helps.SetStringIfDifferentDoc(doc, "project", projectID)
@@ -753,25 +761,22 @@ func geminiToAntigravityDoc(doc *ojson.Doc, modelName string, projectID string, 
 
 	if isImageModel {
 		_ = doc.Set("requestId", generateImageGenRequestID())
-	} else if reqType != "web_search" {
-		sessionID := strings.TrimSpace(doc.Get("request.sessionId").String())
-		if sessionID == "" && len(derivedSessionIDs) > 0 {
-			sessionID = strings.TrimSpace(derivedSessionIDs[0])
+	} else if normalizedReqType != "web_search" {
+		// The official client derives requestId per trajectory as
+		// agent/<cascade_id>/<start millis>/<trajectory_id>/<step>, and
+		// checkpoint/<uuid> for conversation-title calls. request.sessionId is a
+		// client constant that never carries conversation state; conversations
+		// are identified by request.labels.cascade_id.
+		identity := newAntigravityRequestIdentityDoc(doc, derivedConversationIDs)
+		requestID := identity.requestID()
+		if normalizedReqType == "checkpoint" {
+			requestID = "checkpoint/" + uuid.NewString()
 		}
-		if sessionID == "" {
-			sessionID = generateStableSessionIDDoc(doc)
+		_ = doc.Set("requestId", requestID)
+		if normalizedReqType == "agent" {
+			setAntigravityRequestLabelsDoc(doc, modelName, identity)
 		}
-		_ = doc.Set("request.sessionId", sessionID)
-		if reqType == "agent" {
-			call := nextAntigravityCallIdentity(doc, sessionID, modelName)
-			_ = doc.Set("requestId", antigravityAgentRequestID(call))
-			antigravitySetRequestLabels(doc, call, antigravityModelEnum(modelName))
-			agentCall = &call
-		} else {
-			// shortcut: only agent requests carry the CLI trajectory identity; user and tool
-			// probes keep the legacy random ID, upgrade if upstream starts checking those too.
-			_ = doc.Set("requestId", generateRequestID())
-		}
+		_ = doc.Set("request.sessionId", misc.AntigravitySessionID)
 	}
 
 	_ = doc.Delete("request.safetySettings")
@@ -779,11 +784,390 @@ func geminiToAntigravityDoc(doc *ojson.Doc, modelName string, projectID string, 
 		_ = doc.SetRawBytes("request.toolConfig", []byte(toolConfig.Raw))
 		_ = doc.Delete("toolConfig")
 	}
-	return agentCall
 }
 
-func generateRequestID() string {
-	return "agent-" + uuid.NewString()
+// antigravityRequestIdentity holds the identifiers the official client derives
+// for one conversation (cascade) and one user turn inside it (trajectory).
+type antigravityRequestIdentity struct {
+	cascadeID     string
+	trajectoryID  string
+	requestIndex  int
+	lastStepIndex int
+	startMillis   int64
+}
+
+// requestID renders the agent-form requestId. The trailing step is always
+// last_step_index + 1, matching every captured official request.
+func (id antigravityRequestIdentity) requestID() string {
+	return "agent/" + id.cascadeID + "/" + strconv.FormatInt(id.startMillis, 10) + "/" + id.trajectoryID + "/" + strconv.Itoa(id.lastStepIndex+1)
+}
+
+// newAntigravityRequestIdentityDoc rebuilds the conversation identity from data a
+// stateless proxy can see: the downstream conversation seed when one exists,
+// otherwise the first user message (the same seed the stable session id used
+// before). Captured official traffic keeps cascade_id and trajectory_id fixed for
+// the whole conversation, so both derive from that seed alone; the user turn is
+// carried by labels.request_id and the step by labels.last_step_index.
+func newAntigravityRequestIdentityDoc(doc *ojson.Doc, derivedConversationIDs []string) antigravityRequestIdentity {
+	identity := antigravityRequestIdentity{startMillis: time.Now().UnixMilli()}
+	if doc == nil {
+		identity.cascadeID = uuid.NewString()
+		identity.trajectoryID = uuid.NewString()
+		return identity
+	}
+
+	conversationSeed := ""
+	for _, candidate := range derivedConversationIDs {
+		if trimmed := antigravityReplaySessionID(strings.TrimSpace(candidate)); trimmed != "" {
+			conversationSeed = trimmed
+			break
+		}
+	}
+	if conversationSeed == "" {
+		for _, path := range []string{"sessionId", "session_id", "request.sessionId", "request.session_id"} {
+			if id := strings.TrimSpace(doc.Get(path).String()); id != "" {
+				if resolved := antigravityReplaySessionID(id); resolved != "" {
+					conversationSeed = resolved
+					break
+				}
+			}
+		}
+	}
+	if conversationSeed == "" {
+		existingCascade := strings.TrimSpace(doc.Get("request.labels.cascade_id").String())
+		if canonicalCascade, ok := normalizeAntigravityUUID(existingCascade); ok {
+			identity.cascadeID = canonicalCascade
+			existingTrajectory := strings.TrimSpace(doc.Get("request.labels.trajectory_id").String())
+			if canonicalTrajectory, okTraj := normalizeAntigravityUUID(existingTrajectory); okTraj {
+				identity.trajectoryID = canonicalTrajectory
+			} else {
+				identity.trajectoryID = antigravityStableUUID("trajectory", identity.cascadeID)
+			}
+			identity.requestIndex = antigravityCurrentUserTurnDoc(doc)
+			identity.lastStepIndex = antigravityCompletedToolRoundsDoc(doc)
+			return identity
+		}
+		if existingCascade != "" {
+			conversationSeed = existingCascade
+		}
+	}
+	if conversationSeed == "" {
+		conversationSeed = generateAntigravityConversationSeedDoc(doc)
+	}
+	identity.cascadeID = antigravityStableUUID("cascade", conversationSeed)
+	identity.trajectoryID = antigravityStableUUID("trajectory", conversationSeed)
+	identity.requestIndex = antigravityCurrentUserTurnDoc(doc)
+	identity.lastStepIndex = antigravityCompletedToolRoundsDoc(doc)
+	return identity
+}
+
+func normalizeAntigravityUUID(value string) (string, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", false
+	}
+	parsed, err := uuid.Parse(value)
+	if err != nil || parsed == uuid.Nil {
+		return "", false
+	}
+	return parsed.String(), true
+}
+
+func isValidAntigravityUUID(value string) bool {
+	_, ok := normalizeAntigravityUUID(value)
+	return ok
+}
+
+func generateAntigravityConversationSeedDoc(doc *ojson.Doc) string {
+	baseSeed := generateStableSessionIDDoc(doc)
+	if doc == nil {
+		return baseSeed
+	}
+	sys := doc.Get("request.systemInstruction")
+	if !sys.Exists() {
+		sys = doc.Get("systemInstruction")
+	}
+	rawSys := strings.TrimSpace(sys.Raw)
+	if rawSys == "" || rawSys == "null" {
+		return baseSeed
+	}
+	sysHash := sha256.Sum256([]byte(rawSys))
+	return fmt.Sprintf("%s:sys:%x", baseSeed, sysHash[:8])
+}
+
+// antigravityStableUUID maps an identity seed to a random-looking but repeatable
+// identifier shaped like the RFC 4122 v4 uuids the official client generates.
+func antigravityStableUUID(kind string, seed string) string {
+	if strings.TrimSpace(seed) == "" {
+		return uuid.NewString()
+	}
+	sum := sha1.Sum([]byte("cli-proxy-api:antigravity:" + kind + "\x00" + seed))
+	raw := sum[:16]
+	raw[6] = (raw[6] & 0x0f) | 0x40
+	raw[8] = (raw[8] & 0x3f) | 0x80
+	derived, errUUID := uuid.FromBytes(raw)
+	if errUUID != nil {
+		return uuid.NewString()
+	}
+	return derived.String()
+}
+
+func antigravityRequestContentsDoc(doc *ojson.Doc) ojson.Result {
+	contents := doc.Get("request.contents")
+	if !contents.IsArray() {
+		contents = doc.Get("contents")
+	}
+	return contents
+}
+
+// antigravityCurrentUserTurnDoc returns the zero-based ordinal of the newest user
+// message that carries user prompt content, which official traffic encodes as the
+// suffix of labels.request_id. Tool results arrive as user contents carrying
+// functionResponse parts (sometimes alongside injected reminder text), so any
+// message containing a functionResponse does not advance the user turn ordinal.
+func antigravityCurrentUserTurnDoc(doc *ojson.Doc) int {
+	contents := antigravityRequestContentsDoc(doc)
+	if !contents.IsArray() {
+		return 0
+	}
+	turn := 0
+	lastWasUserPayload := false
+	for _, content := range contents.Array() {
+		if content.Get("role").String() != "user" {
+			lastWasUserPayload = false
+			continue
+		}
+		parts := content.Get("parts")
+		if !parts.IsArray() {
+			continue
+		}
+		hasFunctionResponse := false
+		hasUserPayload := false
+		for _, part := range parts.Array() {
+			if part.Get("functionResponse").Exists() {
+				hasFunctionResponse = true
+				break
+			}
+			if part.Get("text").String() != "" || part.Get("inlineData").Exists() || part.Get("fileData").Exists() {
+				hasUserPayload = true
+			}
+		}
+		if hasFunctionResponse {
+			lastWasUserPayload = false
+			continue
+		}
+		if hasUserPayload {
+			if !lastWasUserPayload {
+				turn++
+			}
+			lastWasUserPayload = true
+		}
+	}
+	if turn > 0 {
+		turn--
+	}
+	return turn
+}
+
+// antigravityCompletedToolRoundsDoc counts the completed tool-execution rounds
+// already present in the conversation, which is how many official agent steps
+// have completed. Parallel functionResponses returned together in one message
+// represent a single completed round.
+func antigravityCompletedToolRoundsDoc(doc *ojson.Doc) int {
+	contents := antigravityRequestContentsDoc(doc)
+	if !contents.IsArray() {
+		return 0
+	}
+	rounds := 0
+	for _, content := range contents.Array() {
+		parts := content.Get("parts")
+		if !parts.IsArray() {
+			continue
+		}
+		for _, part := range parts.Array() {
+			if part.Get("functionResponse").Exists() {
+				rounds++
+				break
+			}
+		}
+	}
+	return rounds
+}
+
+// antigravityModelEnumFallbacks covers the window before an account catalog has
+// been fetched. Both values are observed upstream: gemini-3.8-flash-tiered in
+// request.labels across official 2.4.2, 2.12.0, 2.24.0 and 2.31.2, and
+// gemini-3.8-flash-high in the models.<id>.model field of
+// v1internal:fetchAvailableModels. Anything else relies on the fetched catalog.
+var antigravityModelEnumFallbacks = map[string]string{
+	"gemini-3.8-flash-tiered": "MODEL_PLACEHOLDER_M322",
+	"gemini-3.8-flash-high":   "MODEL_PLACEHOLDER_M318",
+}
+
+func normalizeAntigravityModelLookupKey(modelName string) string {
+	trimmed := strings.TrimSpace(modelName)
+	trimmed = strings.TrimPrefix(trimmed, "models/")
+	if idx := strings.LastIndex(trimmed, "/"); idx >= 0 && idx+1 < len(trimmed) {
+		trimmed = strings.TrimSpace(trimmed[idx+1:])
+	}
+	return trimmed
+}
+
+func lookupAntigravityModelInfo(modelName string) *registry.ModelInfo {
+	if modelInfo := registry.LookupModelInfo(modelName, "antigravity"); modelInfo != nil {
+		return modelInfo
+	}
+	normalized := normalizeAntigravityModelLookupKey(modelName)
+	if normalized != "" && normalized != modelName {
+		return registry.LookupModelInfo(normalized, "antigravity")
+	}
+	return nil
+}
+
+func antigravityModelEnum(modelName string) string {
+	if modelInfo := lookupAntigravityModelInfo(modelName); modelInfo != nil {
+		if enum := strings.TrimSpace(modelInfo.AntigravityModelEnum); enum != "" {
+			return enum
+		}
+	}
+	key := strings.ToLower(normalizeAntigravityModelLookupKey(modelName))
+	return antigravityModelEnumFallbacks[key]
+}
+
+// setAntigravityRequestLabelsDoc writes the label set captured from official
+// agent requests: nine keys, every value a string, on the first step of a
+// conversation and on each later step of the same trajectory. Captures cover the
+// Gemini family, and the Claude family shares the same agent request shape, so
+// both are labelled; any other family gets no labels at all rather than guesses.
+// The used_* trio is read off the model of the request that carries it, because
+// one upstream request is the only history a proxy can observe: an Antigravity
+// conversation reports the model it is driving, never the models a previous step
+// used. used_claude_conservative stays false, the value every capture holds,
+// since no capture distinguishes it from used_claude. The optional tenth key
+// (last_execution_id) only ever appeared in GUI traffic that also carries
+// client-side execution records a proxy cannot rebuild.
+// model_enum is dropped on its own when neither the account catalog nor the
+// verified fallback table knows the model, because an invented enum is worse
+// than a missing one.
+func setAntigravityRequestLabelsDoc(doc *ojson.Doc, modelName string, identity antigravityRequestIdentity) {
+	normalizedModel := strings.ToLower(strings.TrimSpace(modelName))
+	usedClaude := strings.Contains(normalizedModel, "claude")
+	if !usedClaude && !strings.Contains(normalizedModel, "gemini") {
+		return
+	}
+	rootCascadeID := identity.cascadeID
+	if existingRoot, ok := normalizeAntigravityUUID(doc.Get("request.labels.root_cascade_id").String()); ok {
+		rootCascadeID = existingRoot
+	}
+	labels := map[string]string{
+		"cascade_id":               identity.cascadeID,
+		"last_step_index":          strconv.Itoa(identity.lastStepIndex),
+		"request_id":               identity.trajectoryID + "-" + strconv.Itoa(identity.requestIndex),
+		"root_cascade_id":          rootCascadeID,
+		"trajectory_id":            identity.trajectoryID,
+		"used_claude":              strconv.FormatBool(usedClaude),
+		"used_claude_conservative": "false",
+		"used_non_gemini_model":    strconv.FormatBool(usedClaude),
+	}
+	if modelEnum := antigravityModelEnum(modelName); modelEnum != "" {
+		labels["model_enum"] = modelEnum
+	}
+	_ = doc.Set("request.labels", labels)
+}
+
+const (
+	antigravityThinkingSmallMaxTokensThreshold = 8192
+	antigravityThinkingMinSafeMaxTokens        = 16384
+	antigravityDefaultContextEqualOutputCap    = 65536
+	antigravityThinkingBudgetOutputHeadroom    = 4096
+)
+
+func antigravityOutputCeiling(modelInfo *registry.ModelInfo) int {
+	if modelInfo == nil {
+		return 0
+	}
+	if modelInfo.OutputTokenLimit > 0 {
+		return modelInfo.OutputTokenLimit
+	}
+	maxCap := modelInfo.MaxCompletionTokens
+	if maxCap <= 0 {
+		return 0
+	}
+	if modelInfo.ContextLength > 0 && maxCap >= modelInfo.ContextLength && maxCap > antigravityDefaultContextEqualOutputCap {
+		return antigravityDefaultContextEqualOutputCap
+	}
+	return maxCap
+}
+
+func applyAntigravityGeminiGenerationShapeDoc(doc *ojson.Doc, modelName string) {
+	requestType := strings.ToLower(strings.TrimSpace(doc.Get("requestType").String()))
+	hasThinkingLevel := doc.Get("request.generationConfig.thinkingConfig.thinkingLevel").Exists()
+	budgetRes := doc.Get("request.generationConfig.thinkingConfig.thinkingBudget")
+	thinkingBudget := 0
+	hasActiveBudget := false
+	if !hasThinkingLevel && budgetRes.Exists() && budgetRes.Type == ojson.Number {
+		thinkingBudget = int(budgetRes.Int())
+		hasActiveBudget = thinkingBudget != 0
+	}
+	if requestType != "" && requestType != "agent" {
+		_ = doc.Delete("request.generationConfig.maxOutputTokens")
+	} else {
+		maxCap := antigravityOutputCeiling(lookupAntigravityModelInfo(modelName))
+		maxOut := doc.Get("request.generationConfig.maxOutputTokens")
+		if !maxOut.Exists() || (maxOut.Type == ojson.Number && maxOut.Int() <= 0) {
+			if maxCap > 0 {
+				_ = doc.Set("request.generationConfig.maxOutputTokens", maxCap)
+			} else if maxOut.Exists() {
+				_ = doc.Delete("request.generationConfig.maxOutputTokens")
+			}
+		} else if maxOut.Type == ojson.Number {
+			current := int(maxOut.Int())
+			if hasThinkingLevel && current > 0 && current < antigravityThinkingSmallMaxTokensThreshold {
+				safeFloor := antigravityThinkingMinSafeMaxTokens
+				if maxCap > 0 && maxCap < safeFloor {
+					safeFloor = maxCap
+				}
+				if current < safeFloor {
+					current = safeFloor
+				}
+			}
+			if thinkingBudget > 0 && current > 0 && current <= thinkingBudget {
+				needed := thinkingBudget + antigravityThinkingBudgetOutputHeadroom
+				if maxCap > 0 && needed > maxCap {
+					needed = maxCap
+				}
+				if needed > current {
+					current = needed
+				}
+			}
+			if maxCap > 0 && current > maxCap {
+				current = maxCap
+			}
+			if current != int(maxOut.Int()) {
+				_ = doc.Set("request.generationConfig.maxOutputTokens", current)
+			}
+		}
+	}
+	if hasThinkingLevel {
+		_ = doc.Delete("request.generationConfig.thinkingConfig.thinkingBudget")
+		if !doc.Get("request.generationConfig.thinkingConfig.includeThoughts").Exists() {
+			_ = doc.Set("request.generationConfig.thinkingConfig.includeThoughts", true)
+		}
+	} else if hasActiveBudget {
+		if !doc.Get("request.generationConfig.thinkingConfig.includeThoughts").Exists() {
+			_ = doc.Set("request.generationConfig.thinkingConfig.includeThoughts", true)
+		}
+	}
+}
+
+// applyAntigravitySystemInstructionRoleDoc stamps the system instruction with
+// role "user", which every official client sends. Inbound translations either
+// already do this or copy a caller-provided object without a role.
+func applyAntigravitySystemInstructionRoleDoc(doc *ojson.Doc) {
+	if doc == nil || !doc.Get("request.systemInstruction").Exists() {
+		return
+	}
+	helps.SetStringIfDifferentDoc(doc, "request.systemInstruction.role", "user")
 }
 
 func generateImageGenRequestID() string {

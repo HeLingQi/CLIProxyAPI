@@ -208,7 +208,6 @@ func (e *AntigravityExecutor) Execute(ctx context.Context, auth *cliproxyauth.Au
 	antiDetail := helps.ParseAntigravityUsage(bodyBytes)
 	helps.ApplyGeminiRequestImageConfig(&antiDetail, requestPayload)
 	reporter.Publish(ctx, antiDetail)
-	e.reportAntigravityAgentTurn(ctx, auth, token, httpReq, baseModel, antiDetail)
 	if responseFormat == sdktranslator.FormatOpenAIResponse {
 		converted = helps.EnsureResponsesUsageDetails(converted)
 	}
@@ -485,7 +484,6 @@ func (e *AntigravityExecutor) executeClaudeNonStream(ctx context.Context, auth *
 	antiDetail := helps.ParseAntigravityUsage(resp.Payload)
 	helps.ApplyGeminiRequestImageConfig(&antiDetail, requestPayload)
 	reporter.Publish(ctx, antiDetail)
-	e.reportAntigravityAgentTurn(ctx, auth, token, httpReq, baseModel, antiDetail)
 	if responseFormat == sdktranslator.FormatOpenAIResponse {
 		converted = helps.EnsureResponsesUsageDetails(converted)
 	}

@@ -41,9 +41,9 @@ type AntigravityModelCapabilityHints struct {
 	WebSearchModelIDs map[string]struct{}
 	// Nil means unknown; an empty non-nil set is an authoritative empty catalog.
 	ModelIDs map[string]struct{}
-	// ModelEnums maps a model ID to the internal model identifier the account catalog
-	// reports. The Antigravity CLI echoes it as the request_labels.model_enum field, so
-	// the proxy needs it to keep the agent request fingerprint identical.
+	// ModelEnums maps a normalized model ID to the upstream model enum reported
+	// as models.<id>.model, which the official client echoes in
+	// request.labels.model_enum.
 	ModelEnums map[string]string
 }
 
@@ -192,9 +192,9 @@ func ParseAntigravityModelCapabilityHints(body []byte) (AntigravityModelCapabili
 		}
 	}
 
-	var modelEnums map[string]string
 	modelsResult := top.Get("models")
 	var modelIDs map[string]struct{}
+	modelEnums := make(map[string]string)
 	if modelsResult.Exists() && modelsResult.Type != ojson.Null {
 		if !modelsResult.IsObject() {
 			return AntigravityModelCapabilityHints{}, false
@@ -204,19 +204,10 @@ func ParseAntigravityModelCapabilityHints(body []byte) (AntigravityModelCapabili
 			return AntigravityModelCapabilityHints{}, false
 		}
 		modelIDs = make(map[string]struct{}, len(modelMap))
-		for id, info := range modelMap {
-			normalized := NormalizeAntigravityModelID(id)
-			if normalized == "" {
-				continue
-			}
-			modelIDs[normalized] = struct{}{}
-			// The catalog names the model through its internal identifier; the CLI sends
-			// that value back as a request label on every agent request.
-			if info.Type == ojson.JSON {
-				if enum := info.Get("model").Str; strings.HasPrefix(enum, "MODEL_") {
-					if modelEnums == nil {
-						modelEnums = make(map[string]string, len(modelMap))
-					}
+		for id, entry := range modelMap {
+			if normalized := NormalizeAntigravityModelID(id); normalized != "" {
+				modelIDs[normalized] = struct{}{}
+				if enum := normalizeAntigravityModelEnum(entry.Get("model").String()); enum != "" {
 					modelEnums[normalized] = enum
 				}
 			}
@@ -250,14 +241,24 @@ func BuildPersistedAntigravityCapabilityHints(project, endpoint string, hints An
 	value := map[string]any{
 		"model_ids": modelItems,
 	}
+	if len(hints.ModelEnums) > 0 {
+		enums := make(map[string]any, len(hints.ModelEnums))
+		for id, enum := range hints.ModelEnums {
+			if normalized := NormalizeAntigravityModelID(id); normalized != "" {
+				if normalizedEnum := normalizeAntigravityModelEnum(enum); normalizedEnum != "" {
+					enums[normalized] = normalizedEnum
+				}
+			}
+		}
+		if len(enums) > 0 {
+			value["model_enums"] = enums
+		}
+	}
 	if project = strings.TrimSpace(project); project != "" {
 		value["project_id"] = project
 	}
 	if endpoint = sanitizeAntigravityPersistedEndpoint(endpoint); endpoint != "" {
 		value["endpoint"] = endpoint
-	}
-	if len(hints.ModelEnums) > 0 {
-		value["model_enums"] = maps.Clone(hints.ModelEnums)
 	}
 	if len(hints.WebSearchModelIDs) > 0 {
 		webSearchIDs := make([]string, 0, len(hints.WebSearchModelIDs))
@@ -315,10 +316,7 @@ func ParsePersistedAntigravityCapabilityHints(metadata map[string]any, expectedP
 		}
 		webSearchModels = parsedWebSearch
 	}
-	modelEnums, okEnums := parsePersistedAntigravityModelEnums(rawMap["model_enums"])
-	if !okEnums {
-		return AntigravityModelCapabilityHints{}, false
-	}
+	modelEnums := parsePersistedAntigravityModelEnums(rawMap["model_enums"])
 	return AntigravityModelCapabilityHints{
 		ModelIDs:          modelIDs,
 		WebSearchModelIDs: webSearchModels,
@@ -326,27 +324,43 @@ func ParsePersistedAntigravityCapabilityHints(metadata map[string]any, expectedP
 	}, true
 }
 
-// parsePersistedAntigravityModelEnums validates the persisted model ID to internal
-// identifier map. A missing entry is a valid empty result because older auth files were
-// written before the label was captured.
-func parsePersistedAntigravityModelEnums(raw any) (map[string]string, bool) {
-	if raw == nil {
-		return nil, true
+// normalizeAntigravityModelEnum keeps upstream-reported model enums from turning
+// arbitrary response text into an outgoing label value.
+func normalizeAntigravityModelEnum(enum string) string {
+	enum = strings.TrimSpace(enum)
+	if enum == "" || len(enum) > antigravityMaxModelIDBytes {
+		return ""
 	}
-	rawMap, okMap := raw.(map[string]any)
-	if !okMap || len(rawMap) > antigravityMaxCatalogModels {
-		return nil, false
-	}
-	enums := make(map[string]string, len(rawMap))
-	for id, value := range rawMap {
-		enum, okValue := value.(string)
-		normalized := NormalizeAntigravityModelID(id)
-		if !okValue || normalized == "" || !strings.HasPrefix(enum, "MODEL_") || len(enum) > antigravityMaxModelIDBytes {
-			return nil, false
+	for _, char := range enum {
+		if (char >= 'A' && char <= 'Z') || (char >= '0' && char <= '9') || char == '_' || char == '-' || char == '.' {
+			continue
 		}
-		enums[normalized] = enum
+		return ""
 	}
-	return enums, true
+	return enum
+}
+
+func parsePersistedAntigravityModelEnums(raw any) map[string]string {
+	items, ok := raw.(map[string]any)
+	if !ok || len(items) == 0 {
+		return nil
+	}
+	enums := make(map[string]string, len(items))
+	for id, value := range items {
+		enum, okEnum := value.(string)
+		if !okEnum {
+			continue
+		}
+		if normalized := NormalizeAntigravityModelID(id); normalized != "" {
+			if normalizedEnum := normalizeAntigravityModelEnum(enum); normalizedEnum != "" {
+				enums[normalized] = normalizedEnum
+			}
+		}
+	}
+	if len(enums) == 0 {
+		return nil
+	}
+	return enums
 }
 
 func parsePersistedAntigravityModelSet(raw any) (map[string]struct{}, bool) {

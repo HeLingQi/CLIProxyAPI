@@ -17,12 +17,13 @@ import (
 )
 
 const (
-	catalogKey             = "usage-pricing:catalog"
-	catalogEncodingVersion = byte(1)
-	maxCatalogModels       = 10000
-	maxCatalogStringBytes  = 4096
-	maxCatalogEncodedBytes = 8 << 20
-	catalogRefreshInterval = 30 * time.Second
+	catalogKey                   = "usage-pricing:catalog"
+	catalogEncodingVersion       = byte(2)
+	legacyCatalogEncodingVersion = byte(1)
+	maxCatalogModels             = 10000
+	maxCatalogStringBytes        = 4096
+	maxCatalogEncodedBytes       = 8 << 20
+	catalogRefreshInterval       = 30 * time.Second
 )
 
 type modelIdentity struct {
@@ -31,9 +32,10 @@ type modelIdentity struct {
 }
 
 type snapshot struct {
-	revision int64
-	models   []ModelConfig
-	byKey    map[modelIdentity]ModelConfig
+	revision    int64
+	models      []ModelConfig
+	byKey       map[modelIdentity]ModelConfig
+	expressions map[modelIdentity]*compiledExpression
 }
 
 // Catalog atomically publishes validated pricing snapshots persisted in the active KV store.
@@ -137,6 +139,35 @@ func (c *Catalog) Upsert(ctx context.Context, expectedRevision int64, config Mod
 	})
 }
 
+// UpsertMany validates and atomically saves multiple model configurations.
+func (c *Catalog) UpsertMany(ctx context.Context, expectedRevision int64, configs []ModelConfig) (State, error) {
+	return c.mutate(ctx, expectedRevision, func(models []ModelConfig) ([]ModelConfig, error) {
+		return mergeModels(models, configs)
+	})
+}
+
+func mergeModels(models []ModelConfig, configs []ModelConfig) ([]ModelConfig, error) {
+	for _, config := range configs {
+		normalized, errNormalize := normalizeModel(config)
+		if errNormalize != nil {
+			return nil, errNormalize
+		}
+		key := modelKey(normalized.Provider, normalized.Model)
+		replaced := false
+		for index := range models {
+			if modelKey(models[index].Provider, models[index].Model) == key {
+				models[index] = normalized
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			models = append(models, normalized)
+		}
+	}
+	return models, nil
+}
+
 // Delete atomically removes one provider/model price at the expected revision.
 func (c *Catalog) Delete(ctx context.Context, expectedRevision int64, provider, model string) (State, error) {
 	provider = normalizeName(provider)
@@ -210,7 +241,7 @@ func (c *Catalog) mutate(ctx context.Context, expectedRevision int64, apply func
 
 // Quote resolves response model, requested model, then alias and calculates a fixed-point estimate.
 func (c *Catalog) Quote(subject Subject) Quote {
-	if c == nil || subject.UncachedInput < 0 || subject.CacheReadInput < 0 || subject.CacheWriteInput < 0 || subject.Output < 0 {
+	if c == nil || subject.UncachedInput < 0 || subject.CacheReadInput < 0 || subject.CacheWriteInput < 0 || subject.CacheWrite1h < 0 || subject.CacheWrite12h < 0 || subject.Output < 0 || subject.AudioInput < 0 || subject.AudioOutput < 0 || subject.InputLength < 0 || subject.ImageCount < 0 {
 		return Quote{}
 	}
 	current := c.current.Load()
@@ -224,9 +255,40 @@ func (c *Catalog) Quote(subject Subject) Quote {
 		if model == "" {
 			continue
 		}
-		config, found := current.byKey[modelKey(provider, model)]
+		key := modelKey(provider, model)
+		config, found := current.byKey[key]
 		if !found {
 			continue
+		}
+		result.Model = config.Model
+		result.Source = config.Source
+		if expression := current.expressions[key]; expression != nil {
+			genericCacheWrite := subject.CacheWriteInput - subject.CacheWrite1h - subject.CacheWrite12h
+			if genericCacheWrite < 0 {
+				return result
+			}
+			inputLength := subject.InputLength
+			if inputLength == 0 {
+				inputLength = subject.UncachedInput + subject.CacheReadInput + subject.CacheWriteInput
+			}
+			at := subject.At
+			if at.IsZero() {
+				at = time.Now()
+			}
+			evaluated, errEvaluate := expression.Evaluate(expressionContext{
+				UncachedInput: subject.UncachedInput, CacheReadInput: subject.CacheReadInput,
+				CacheWriteInput: genericCacheWrite, CacheWrite1h: subject.CacheWrite1h,
+				CacheWrite12h: subject.CacheWrite12h, Output: subject.Output,
+				AudioInput: subject.AudioInput, AudioOutput: subject.AudioOutput,
+				InputLength: inputLength, ImageCount: subject.ImageCount, Thinking: subject.Thinking, At: at,
+			})
+			if errEvaluate != nil {
+				return result
+			}
+			result.Available = true
+			result.USDMicros = evaluated.USDMicros
+			result.Tier = evaluated.Tier
+			return result
 		}
 		value, ok := calculateCost(subject, config.BasePrices)
 		if !ok {
@@ -234,7 +296,6 @@ func (c *Catalog) Quote(subject Subject) Quote {
 		}
 		result.Available = true
 		result.USDMicros = value
-		result.Model = config.Model
 		return result
 	}
 	return result
@@ -271,20 +332,29 @@ func calculateCost(subject Subject, prices BasePrices) (int64, bool) {
 func normalizeModel(config ModelConfig) (ModelConfig, error) {
 	config.Provider = normalizeName(config.Provider)
 	config.Model = normalizeName(config.Model)
+	config.Expression = strings.TrimSpace(config.Expression)
+	config.Source = strings.TrimSpace(config.Source)
 	if config.Provider == "" || config.Model == "" {
 		return ModelConfig{}, fmt.Errorf("%w: provider and model are required", ErrInvalidModel)
 	}
-	if !utf8.ValidString(config.Provider) || !utf8.ValidString(config.Model) {
-		return ModelConfig{}, fmt.Errorf("%w: provider and model must be valid UTF-8", ErrInvalidModel)
+	if !utf8.ValidString(config.Provider) || !utf8.ValidString(config.Model) || !utf8.ValidString(config.Expression) || !utf8.ValidString(config.Source) {
+		return ModelConfig{}, fmt.Errorf("%w: pricing fields must be valid UTF-8", ErrInvalidModel)
 	}
-	if len(config.Provider) > maxCatalogStringBytes || len(config.Model) > maxCatalogStringBytes {
-		return ModelConfig{}, fmt.Errorf("%w: provider or model is too long", ErrInvalidModel)
+	if len(config.Provider) > maxCatalogStringBytes || len(config.Model) > maxCatalogStringBytes || len(config.Expression) > maxPricingExpressionBytes || len(config.Source) > maxCatalogStringBytes {
+		return ModelConfig{}, fmt.Errorf("%w: pricing field is too long", ErrInvalidModel)
 	}
 	prices := []USDPerMillion{config.BasePrices.Input, config.BasePrices.Output, config.BasePrices.CacheRead, config.BasePrices.CacheWrite}
 	for _, price := range prices {
 		if price < 0 {
 			return ModelConfig{}, fmt.Errorf("%w: prices cannot be negative", ErrInvalidModel)
 		}
+	}
+	if config.Expression != "" {
+		if _, errCompile := compileExpression(config.Expression); errCompile != nil {
+			return ModelConfig{}, fmt.Errorf("%w: %v", ErrInvalidModel, errCompile)
+		}
+	} else {
+		config.Source = ""
 	}
 	return config, nil
 }
@@ -298,10 +368,17 @@ func newSnapshot(state State) *snapshot {
 	models := cloneModels(state.Models)
 	sortModels(models)
 	byKey := make(map[modelIdentity]ModelConfig, len(models))
+	expressions := make(map[modelIdentity]*compiledExpression)
 	for _, model := range models {
-		byKey[modelKey(model.Provider, model.Model)] = model
+		key := modelKey(model.Provider, model.Model)
+		byKey[key] = model
+		if model.Expression != "" {
+			if expression, errCompile := compileExpression(model.Expression); errCompile == nil {
+				expressions[key] = expression
+			}
+		}
 	}
-	return &snapshot{revision: state.Revision, models: models, byKey: byKey}
+	return &snapshot{revision: state.Revision, models: models, byKey: byKey, expressions: expressions}
 }
 
 func cloneModels(models []ModelConfig) []ModelConfig {
@@ -325,7 +402,7 @@ func encodeState(state State) ([]byte, error) {
 	if state.Revision < 0 || len(state.Models) > maxCatalogModels {
 		return nil, errors.New("invalid pricing catalog state")
 	}
-	encoded := make([]byte, 1, 16+len(state.Models)*64)
+	encoded := make([]byte, 1, 16+len(state.Models)*96)
 	encoded[0] = catalogEncodingVersion
 	encoded = binary.BigEndian.AppendUint64(encoded, uint64(state.Revision))
 	encoded = binary.BigEndian.AppendUint32(encoded, uint32(len(state.Models)))
@@ -345,6 +422,8 @@ func encodeState(state State) ([]byte, error) {
 		for _, price := range []USDPerMillion{normalized.BasePrices.Input, normalized.BasePrices.Output, normalized.BasePrices.CacheRead, normalized.BasePrices.CacheWrite} {
 			encoded = binary.BigEndian.AppendUint64(encoded, uint64(price.Micros()))
 		}
+		encoded = appendCatalogString(encoded, normalized.Expression)
+		encoded = appendCatalogString(encoded, normalized.Source)
 	}
 	if len(encoded) > maxCatalogEncodedBytes {
 		return nil, errors.New("pricing catalog exceeds size limit")
@@ -353,9 +432,10 @@ func encodeState(state State) ([]byte, error) {
 }
 
 func decodeState(encoded []byte) (State, error) {
-	if len(encoded) < 13 || len(encoded) > maxCatalogEncodedBytes || encoded[0] != catalogEncodingVersion {
+	if len(encoded) < 13 || len(encoded) > maxCatalogEncodedBytes || (encoded[0] != catalogEncodingVersion && encoded[0] != legacyCatalogEncodingVersion) {
 		return State{}, errors.New("invalid pricing catalog encoding")
 	}
+	version := encoded[0]
 	offset := 1
 	revisionRaw := binary.BigEndian.Uint64(encoded[offset : offset+8])
 	offset += 8
@@ -392,19 +472,33 @@ func decodeState(encoded []byte) (State, error) {
 			}
 			values[index] = USDPerMillion(raw)
 		}
-		config, errNormalize := normalizeModel(ModelConfig{Provider: provider, Model: model, BasePrices: BasePrices{Input: values[0], Output: values[1], CacheRead: values[2], CacheWrite: values[3]}})
+		config := ModelConfig{Provider: provider, Model: model, BasePrices: BasePrices{Input: values[0], Output: values[1], CacheRead: values[2], CacheWrite: values[3]}}
+		if version >= 2 {
+			expression, nextExpression, errExpression := readCatalogString(encoded, offset)
+			if errExpression != nil {
+				return State{}, errExpression
+			}
+			offset = nextExpression
+			source, nextSource, errSource := readCatalogString(encoded, offset)
+			if errSource != nil {
+				return State{}, errSource
+			}
+			offset = nextSource
+			config.Expression, config.Source = expression, source
+		}
+		normalized, errNormalize := normalizeModel(config)
 		if errNormalize != nil {
 			return State{}, errNormalize
 		}
-		key := modelKey(config.Provider, config.Model)
+		key := modelKey(normalized.Provider, normalized.Model)
 		if _, duplicate := seen[key]; duplicate {
 			return State{}, errors.New("duplicate pricing model")
 		}
 		seen[key] = struct{}{}
-		state.Models = append(state.Models, config)
+		state.Models = append(state.Models, normalized)
 	}
 	if offset != len(encoded) {
-		return State{}, errors.New("pricing catalog contains trailing data")
+		return State{}, errors.New("trailing pricing catalog data")
 	}
 	sortModels(state.Models)
 	return state, nil
