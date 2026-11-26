@@ -8,7 +8,7 @@ It uses the official [`github.com/openai/openai-go/v3`](https://github.com/opena
 
 1. Start CLIProxyAPI with at least one working ChatGPT/Codex OAuth credential.
 2. Configure a proxy API key in `config.yaml`.
-3. Use Go 1.26 or newer.
+3. Use Go 1.27 or newer.
 4. Prepare a PCM WAV file with these exact properties:
    - 24,000 Hz sample rate
    - 16-bit signed PCM

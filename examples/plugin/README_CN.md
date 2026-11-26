@@ -16,6 +16,7 @@
 - `codex-service-tier/`：仅 Go 实现的请求规整插件，启用后会将 Codex `gpt-5.5` 请求设置为 priority service tier。
 - `request-lifecycle/`：仅 Go 实现的请求生命周期插件，演示并发控制、主动终止 HTTP 请求和终态回调。
 - `scheduler/`：仅 Go 实现的调度插件，可选择指定 auth ID、委托内置调度器或拒绝调度。
+- `claude-web-search-router/`：面向 Claude Code 内置 `web_search` 的 ModelRouter 与执行器示例。详见 `claude-web-search-router/README.md`。
 - `response-translator/`：只演示响应转换能力。
 - `response-normalizer/`：只演示响应规整能力。
 - `thinking/`：只演示 Thinking 处理能力。

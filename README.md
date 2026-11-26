@@ -44,6 +44,104 @@ CLIProxyAPI 是一个为 CLI 提供 OpenAI/Gemini/Claude/Codex 兼容 API 接口
 - 通过配置接入上游 OpenAI 兼容提供商（例如 OpenRouter）
 - 可复用的 Go SDK（见 `docs/sdk-usage_CN.md`）
 
+## 技术栈
+
+- **核心语言与运行时**：Go `1.27.4`（模块 `github.com/router-for-me/CLIProxyAPI/v8`）
+- **HTTP 与路由框架**：Gin（`github.com/gin-gonic/gin`）
+- **终端界面（TUI）**：Bubbletea + Bubbles + Lipgloss（支持 `--tui` / `--standalone`）
+- **协议、流式与实时通信**：`gorilla/websocket`、`pion/webrtc/v4`、`refraction-networking/utls`、`MoeForge/moego`（`ojson` / `base64`）
+- **持久化与外部存储**：本地文件 / BoltDB（默认）、PostgreSQL（`pgx/v5`）、Redis（`go-redis/v9`）、Git 仓库（`go-git/v6`）、S3/对象存储（`minio-go/v7`）
+- **插件扩展**：基于 C ABI 的动态库插件系统（提供 Go / C / Rust 插件示例）
+
+## 目录结构
+
+```text
+CLIProxyAPI/
+├── cmd/
+│   ├── server/                     # 服务主入口与 CLI 命令处理
+│   ├── fetch_antigravity_models/   # Antigravity 模型拉取工具
+│   ├── fetch_codex_models/         # Codex 模型拉取工具
+│   └── validate_codex_models/      # Codex 模型校验工具
+├── internal/
+│   ├── api/                        # Gin HTTP 服务、路由、中间件与协议复用
+│   ├── auth/                       # 各上游提供商 OAuth 与凭据管理（antigravity/claude/codex/vertex）
+│   ├── runtime/executor/           # 各提供商运行时执行器（含 Codex WebSocket）
+│   ├── translator/                 # OpenAI / Gemini / Claude / Codex / Antigravity 协议转换
+│   ├── thinking/                   # 统一 Thinking / Reasoning 解析与提供商适配管线
+│   ├── registry/                   # 模型注册表与远程模型更新器
+│   ├── pricing/                    # 动态模型定价与价格同步
+│   ├── usagehistory/               # 用量历史持久化与按客户端 API Key（SK）统计
+│   ├── store/                      # 本地、PostgreSQL、Git、对象存储后端实现
+│   ├── watcher/                    # 配置与凭据热重载监听
+│   ├── pluginhost/ & pluginstore/  # 原生动态库插件宿主加载与存储管理
+│   ├── home/ & homeplugins/        # CLIProxyAPIHome 控制面接入与协调
+│   ├── wsrelay/                    # WebSocket 中继会话管理
+│   └── tui/                        # Bubbletea 交互式终端界面
+├── sdk/                            # 可嵌入外部 Go 项目的公开 SDK（cliproxy/translator/pluginabi 等）
+├── docs/                           # SDK、Management API v8、局域网发现、定价同步等文档
+├── examples/                       # 自定义 Provider、Realtime 语音与动态库插件示例
+├── test/                           # 跨模块集成测试
+├── auths/                          # 默认凭据目录
+├── config.example.yaml             # 完整配置模板
+├── .env.example                    # 环境变量模板（存储与管理面板）
+├── .env.cluster.example            # 集群模式环境变量模板
+└── Dockerfile / docker-compose.yml # 容器镜像与编排配置
+```
+
+## 核心模块
+
+- **API 网关与多协议转换（`internal/api`、`internal/translator`）**：统一暴露 OpenAI（含 Responses / Realtime）、Gemini（含 Interactions）、Claude 与 Codex 兼容接口，并在各协议格式间自动转换。
+- **执行器与负载均衡（`internal/runtime/executor`、`internal/credentialweight`、`sdk/cliproxy/auth`）**：支持多账户轮询 / 权重调度、流式与非流式响应、WebSocket 代理、重试与自动故障转移。
+- **Thinking 管线（`internal/thinking`）**：解析模型后缀与请求体中的思考预算参数，归一化为统一 `ThinkingConfig` 后下发至对应提供商。
+- **模型注册与动态定价（`internal/registry`、`internal/pricing`、`internal/usagehistory`）**：自动拉取或本地维护模型列表与定价，持久化请求历史并支持按客户端 Key 统计 Token 与成本。
+- **配置热重载与多后端存储（`internal/watcher`、`internal/store`）**：监听 `config.yaml` 与 `auths/` 变化实时生效，支持切换至 PostgreSQL、Git 或对象存储后端。
+- **插件系统与嵌入式 SDK（`internal/pluginhost`、`sdk/`）**：支持通过 C ABI 加载外部动态库插件扩展认证、路由、调度与翻译能力，也支持作为 Go SDK 嵌入其他程序。
+
+## 配置与环境变量
+
+默认读取工作目录下的 `config.yaml`（可由 `config.example.yaml` 复制修改），并自动加载同目录的 `.env` 文件；凭据默认存放在 `auths/` 目录。默认服务监听端口为 `8317`。
+
+常用环境变量（参见 [`.env.example`](.env.example) 与 [`.env.cluster.example`](.env.cluster.example)）：
+
+| 环境变量 | 说明 |
+| --- | --- |
+| `MANAGEMENT_PASSWORD` | 管理 Web UI / Management API 密码 |
+| `PGSTORE_DSN` / `PGSTORE_SCHEMA` / `PGSTORE_LOCAL_PATH` | 可选：PostgreSQL 凭据存储配置 |
+| `GITSTORE_GIT_URL` / `GITSTORE_GIT_USERNAME` / `GITSTORE_GIT_TOKEN` / `GITSTORE_LOCAL_PATH` | 可选：Git 仓库配置与凭据同步 |
+| `OBJECTSTORE_ENDPOINT` / `OBJECTSTORE_BUCKET` / `OBJECTSTORE_ACCESS_KEY` / `OBJECTSTORE_SECRET_KEY` / `OBJECTSTORE_LOCAL_PATH` | 可选：S3 兼容对象存储后端 |
+| `HOME_JWT` | 可选：集群模式下连接 CLIProxyAPIHome 的认证 JWT |
+
+## 构建、开发运行与测试
+
+环境要求：**Go 1.27+**（推荐 `1.27.4`）。
+
+```bash
+# 1. 准备配置文件
+cp config.example.yaml config.yaml
+
+# 2. 开发模式直接运行
+go run ./cmd/server --config config.yaml
+
+# 3. 编译二进制
+go build -o cli-proxy-api ./cmd/server
+
+# 4. 常用启动参数
+./cli-proxy-api --config config.yaml            # 指定配置文件
+./cli-proxy-api --tui                           # 启动交互式 TUI 客户端
+./cli-proxy-api --standalone                    # 内嵌服务 + TUI 一体化运行
+./cli-proxy-api --local-model                   # 禁用远程模型更新，仅使用本地模型定义
+./cli-proxy-api --no-browser                    # OAuth 登录时不自动打开浏览器
+
+# 5. 代码格式化与测试
+gofmt -w .
+go vet ./...
+go test ./...
+
+# 6. Docker 构建与运行
+docker build -t cliproxyapi .
+docker compose up -d
+```
+
 ## 新手入门
 
 CLIProxyAPI 用户手册： [https://help.router-for.me/](https://help.router-for.me/cn/)

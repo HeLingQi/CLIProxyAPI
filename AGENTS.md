@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Go 1.26+ proxy server providing OpenAI/Gemini/Claude/Codex compatible APIs with OAuth and round-robin load balancing.
+Go 1.27+ proxy server providing OpenAI/Gemini/Claude/Codex compatible APIs with OAuth and round-robin load balancing.
 
 ## Repository
 - GitHub: https://github.com/router-for-me/CLIProxyAPI
@@ -24,19 +24,21 @@ go build -o test-output ./cmd/server && rm test-output # Verify compile (REQUIRE
 
 ## Architecture
 - `cmd/server/` — Server entrypoint
-- `internal/api/` — Gin HTTP API (routes, middleware, modules)
-- `internal/api/modules/amp/` — Amp integration (Amp-style routes + reverse proxy)
+- `cmd/fetch_antigravity_models/`, `cmd/fetch_codex_models/`, `cmd/validate_codex_models/` — Model fetch and validation CLIs
+- `internal/api/` — Gin HTTP API (routes, handlers, middleware, protocol multiplexer)
 - `internal/thinking/` — Main thinking/reasoning pipeline. `ApplyThinking()` (apply.go) parses suffixes (`suffix.go`, suffix overrides body), normalizes config to canonical `ThinkingConfig` (`types.go`), normalizes and validates centrally (`validate.go`/`convert.go`), then applies provider-specific output via `ProviderApplier`. Do not break this "canonical representation → per-provider translation" architecture.
 - `internal/runtime/executor/` — Per-provider runtime executors (incl. Codex WebSocket)
 - `internal/translator/` — Provider protocol translators (and shared `common`)
 - `internal/registry/` — Model registry + remote updater (`StartModelsUpdater`); `--local-model` disables remote updates
+- `internal/pricing/` — Dynamic model pricing and sync
 - `internal/store/` — Storage implementations and secret resolution
 - `internal/managementasset/` — Config snapshots and management assets
+- `internal/pluginhost/`, `internal/pluginstore/` — Native dynamic library plugin host, C ABI loader, and plugin store
 - `internal/cache/` — Request signature caching
 - `internal/watcher/` — Config hot-reload and watchers
 - `internal/wsrelay/` — WebSocket relay sessions
-- `internal/usage/` — Usage and token accounting
-- `internal/home/` — CLIProxyAPIHome control plane integration (bootstrap, RESP communication, dispatch coordination)
+- `internal/usagehistory/` — Usage history persistence and per-key/per-model token accounting
+- `internal/home/`, `internal/homeplugins/` — CLIProxyAPIHome control plane integration (bootstrap, RESP communication, dispatch coordination)
 - `internal/tui/` — Bubbletea terminal UI (`--tui`, `--standalone`)
 - `sdk/cliproxy/` — Embeddable SDK entry (service/builder/watchers/pipeline)
 - `test/` — Cross-module integration tests

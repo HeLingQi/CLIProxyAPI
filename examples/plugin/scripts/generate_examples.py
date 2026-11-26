@@ -193,7 +193,7 @@ def generate_go(cap: Capability) -> None:
         method_cases.append(f'\tcase "{method}":\n{host_callback_call}\t\treturn okEnvelopeJSON({json.dumps(result_for_method(cap, "go", method))})')
     go_mod = f"""module github.com/router-for-me/CLIProxyAPI/v7/examples/plugin/{slug}/go
 
-go 1.26
+go 1.27.4
 """
     go_main = f"""package main
 
