@@ -2,13 +2,19 @@ package executor
 
 import (
 	"fmt"
-	"regexp"
+	"net/http"
+	"net/http/httptest"
 	"slices"
 	"strings"
 	"testing"
 
 	"github.com/MoeForge/moego/ojson"
+	"github.com/MoeForge/moego/regexp"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 )
 
 var issue6478Calls = []struct {
@@ -50,6 +56,122 @@ func issue6478AssertPortableIDs(t *testing.T, ids []string) {
 		if i >= 2 && id != issue6478Calls[i].id {
 			t.Errorf("already legal tool_use.id[%d] = %q, want unchanged %q", i, id, issue6478Calls[i].id)
 		}
+	}
+}
+
+// Exercise both public execution paths, then replay the client-visible IDs back
+// through the real Claude-to-Devin request builder and inspect the wire payload.
+func TestIssue6478_DevinClaudeOutputAndToolResultRoundTrip(t *testing.T) {
+	var frames []byte
+	for i, call := range issue6478Calls {
+		tool := appendDevinFieldBytes(nil, 1, []byte(call.id))
+		tool = appendDevinFieldBytes(tool, 2, []byte(call.name))
+		tool = appendDevinFieldBytes(tool, 3, []byte(`{}`))
+		tool = appendVarintField(tool, 4, uint64(i))
+		frame := appendDevinFieldBytes(nil, 6, tool)
+		frames = append(frames, helps.WrapConnectEnvelope(frame)...)
+	}
+	frames = append(frames, helps.WrapConnectEnvelopeWithFlag(helps.ConnectFlagEndStream, []byte(`{}`))...)
+
+	var idsByMode [][]string
+	for _, stream := range []bool{false, true} {
+		name := "Execute"
+		if stream {
+			name = "ExecuteStream"
+		}
+		t.Run(name, func(t *testing.T) {
+			requests := make(chan []byte, 2)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, wire, errRead := helps.ReadConnectFrame(r.Body)
+				if errRead != nil {
+					t.Errorf("read upstream request: %v", errRead)
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				requests <- wire
+				w.Header().Set("Content-Type", "application/connect+proto")
+				if _, errWrite := w.Write(frames); errWrite != nil {
+					t.Errorf("write upstream response: %v", errWrite)
+				}
+			}))
+			defer server.Close()
+
+			cfg := &config.Config{}
+			executor := NewDevinExecutor(cfg)
+			auth := &cliproxyauth.Auth{ID: t.Name(), Provider: "devin", Attributes: map[string]string{"api_key": "test-key", "base_url": server.URL}}
+			payload := []byte(`{"model":"devin/swe-2","max_tokens":64,"messages":[{"role":"user","content":"run tools"}]}`)
+			req := cliproxyexecutor.Request{Model: "devin/swe-2", Payload: payload}
+			opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude, OriginalRequest: payload, Stream: stream}
+			var ids []string
+			if stream {
+				result, errStream := executor.ExecuteStream(t.Context(), auth, req, opts)
+				if errStream != nil {
+					t.Fatalf("ExecuteStream: %v", errStream)
+				}
+				for chunk := range result.Chunks {
+					if chunk.Err != nil {
+						t.Fatalf("stream chunk: %v", chunk.Err)
+					}
+					for _, line := range strings.Split(string(chunk.Payload), "\n") {
+						event := ojson.Parse(strings.TrimPrefix(line, "data: "))
+						if event.Get("type").String() == "content_block_start" && event.Get("content_block.type").String() == "tool_use" {
+							ids = append(ids, event.Get("content_block.id").String())
+						}
+					}
+				}
+			} else {
+				result, errExecute := executor.Execute(t.Context(), auth, req, opts)
+				if errExecute != nil {
+					t.Fatalf("Execute: %v", errExecute)
+				}
+				for _, block := range ojson.GetBytes(result.Payload, "content").Array() {
+					if block.Get("type").String() == "tool_use" {
+						ids = append(ids, block.Get("id").String())
+					}
+				}
+			}
+			<-requests
+			issue6478AssertPortableIDs(t, ids)
+			idsByMode = append(idsByMode, ids)
+
+			cfg.Payload = config.PayloadConfig{Override: []config.PayloadRule{{
+				Models: []config.PayloadModelRule{{Name: "*", Match: []map[string]any{{
+					"prompts.1.tool_calls.0.id": issue6478Calls[0].id,
+					"prompts.2.tool_call_id":    issue6478Calls[0].id,
+				}}}},
+				Params: map[string]any{"system_prompt": "observed original Devin IDs"},
+			}}}
+			req.Payload = issue6478History(ids)
+			opts.OriginalRequest = req.Payload
+			opts.Stream = false
+			if _, errReplay := executor.Execute(t.Context(), auth, req, opts); errReplay != nil {
+				t.Fatalf("replay tool results: %v", errReplay)
+			}
+			_, native, errDecode := helps.FinalizeDevinPayload(<-requests, func(body []byte) []byte { return body })
+			if errDecode != nil {
+				t.Fatalf("decode sent Devin payload: %v", errDecode)
+			}
+			if ojson.GetBytes(native, "system_prompt").String() != "observed original Devin IDs" {
+				t.Errorf("Devin payload condition did not observe original call/result IDs before final barrier")
+			}
+			var sentCalls, sentResults []string
+			for _, prompt := range ojson.GetBytes(native, "prompts").Array() {
+				for _, call := range prompt.Get("tool_calls").Array() {
+					sentCalls = append(sentCalls, call.Get("id").String())
+				}
+				if prompt.Get("source").Int() == 4 {
+					sentResults = append(sentResults, prompt.Get("tool_call_id").String())
+				}
+			}
+			for i, call := range issue6478Calls {
+				if i >= len(sentCalls) || i >= len(sentResults) || sentCalls[i] != call.id || sentResults[i] != call.id {
+					t.Errorf("Devin replay[%d] must restore original ID %q for call and result; calls=%q results=%q", i, call.id, sentCalls, sentResults)
+				}
+			}
+		})
+	}
+	if len(idsByMode) == 2 && !slices.Equal(idsByMode[0], idsByMode[1]) {
+		t.Errorf("stream/non-stream IDs differ: %q vs %q", idsByMode[0], idsByMode[1])
 	}
 }
 

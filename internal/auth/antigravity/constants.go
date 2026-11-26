@@ -6,22 +6,16 @@ const (
 	ClientID     = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"
 	ClientSecret = "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"
 	CallbackPort = 51121
-	// CallbackPath is the loopback redirect path the official client registers;
-	// Google accepts any path on localhost for this installed-app client, so the
-	// only reason to keep another value would be to stay unlike the real client.
-	CallbackPath = "/auth/callback"
 )
 
-// Scopes defines the OAuth scopes required for Antigravity authentication.
-// The order is the one the official client sends on the consent URL, so a
-// re-authorised grant records the same scope sequence.
+// Scopes defines the OAuth scopes required for Antigravity authentication
 var Scopes = []string{
 	"https://www.googleapis.com/auth/cloud-platform",
 	"https://www.googleapis.com/auth/userinfo.email",
 	"https://www.googleapis.com/auth/userinfo.profile",
+	"https://www.googleapis.com/auth/aicode",
 	"https://www.googleapis.com/auth/cclog",
 	"https://www.googleapis.com/auth/experimentsandconfigs",
-	"https://www.googleapis.com/auth/aicode",
 }
 
 // OAuth2 endpoints for Google authentication

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -136,6 +137,16 @@ type ClaudeConfig struct {
 	// KV) is active, session date pins are persisted permanently and
 	// session-date-pin-days is ignored.
 	SessionDatePinDays *int `yaml:"session-date-pin-days" json:"session-date-pin-days"`
+	// OAuthIncludeCreateAPIKey controls whether new Claude OAuth authorization
+	// URLs request the org:create_api_key scope in addition to ClaudeOAuthScope.
+	// Nil defaults to true to match native Claude Code.
+	OAuthIncludeCreateAPIKey *bool `yaml:"oauth-include-create-api-key,omitempty" json:"oauth-include-create-api-key,omitempty"`
+}
+
+// OAuthIncludeCreateAPIKeyEnabled reports whether Claude OAuth authorization
+// requests should include the org:create_api_key scope.
+func (c *ClaudeConfig) OAuthIncludeCreateAPIKeyEnabled() bool {
+	return c == nil || c.OAuthIncludeCreateAPIKey == nil || *c.OAuthIncludeCreateAPIKey
 }
 
 // DefaultClaudeSessionDatePinDays is the session date pin retention applied
@@ -208,6 +219,15 @@ type XAIConfig struct {
 	InjectXSearch bool `yaml:"inject-x-search" json:"inject-x-search"`
 }
 
+// SensitivePatternRule defines a Go RE2 regular expression replacement rule.
+type SensitivePatternRule struct {
+	// Pattern is the Go RE2 regular expression to match.
+	Pattern string `yaml:"pattern" json:"pattern"`
+
+	// Replacement is the substitution string (empty string deletes matches).
+	Replacement string `yaml:"replacement" json:"replacement"`
+}
+
 // DevinConfig configures provider-wide Devin request behavior.
 type DevinConfig struct {
 	// SensitiveWords is a list of words to obfuscate with zero-width characters in system prompts and messages.
@@ -215,6 +235,9 @@ type DevinConfig struct {
 
 	// SensitiveWordsReplace maps sensitive words or phrases to literal replacements in system prompts.
 	SensitiveWordsReplace map[string]string `yaml:"sensitive-words-replace,omitempty" json:"sensitive-words-replace,omitempty"`
+
+	// SensitivePatternsReplace defines ordered Go RE2 regex replacement rules for system prompts.
+	SensitivePatternsReplace []SensitivePatternRule `yaml:"sensitive-patterns-replace,omitempty" json:"sensitive-patterns-replace,omitempty"`
 }
 
 // ProxyConnectionPoolConfig configures upstream connection reuse for one api-key
@@ -252,14 +275,18 @@ type AntigravityConfig struct {
 	// SensitiveWordsReplace maps sensitive words or phrases to literal replacements in system instructions.
 	SensitiveWordsReplace map[string]string `yaml:"sensitive-words-replace,omitempty" json:"sensitive-words-replace,omitempty"`
 
+	// SensitivePatternsReplace defines ordered Go RE2 regex replacement rules for system instructions.
+	SensitivePatternsReplace []SensitivePatternRule `yaml:"sensitive-patterns-replace,omitempty" json:"sensitive-patterns-replace,omitempty"`
+
 	// ConnectionPool configures upstream HTTP connection pooling behavior for Antigravity.
 	ConnectionPool AntigravityConnectionPoolConfig `yaml:"connection-pool,omitempty" json:"connection-pool,omitempty"`
 
-	// PinnedVersion optionally overrides the emulated Antigravity Hub version when paired with PinnedChangelist.
-	PinnedVersion string `yaml:"pinned-version,omitempty" json:"pinned-version,omitempty"`
-
-	// PinnedChangelist optionally overrides the emulated Antigravity Hub changelist when paired with PinnedVersion.
-	PinnedChangelist string `yaml:"pinned-changelist,omitempty" json:"pinned-changelist,omitempty"`
+	// TOSPauseWindow controls the pool-wide protective pause armed after the first
+	// 403 TOS_VIOLATION. Defaults to "0" (disabled), so only the violating
+	// credential is deactivated unless a positive Go duration string (e.g. "6h")
+	// is explicitly configured. Set to "0", "off", "false", "none", or
+	// "disabled" to explicitly disable the pause.
+	TOSPauseWindow string `yaml:"tos-pause-window,omitempty" json:"tos-pause-window,omitempty"`
 }
 
 // AntigravityConnectionPoolConfig controls upstream HTTP/1.1 connection pooling behavior for Antigravity.
@@ -273,7 +300,7 @@ type AntigravityConnectionPoolConfig struct {
 	IdleConnTimeout string `yaml:"idle-conn-timeout,omitempty" json:"idle-conn-timeout,omitempty"`
 
 	// MaxIdleConnsPerHost specifies the maximum number of idle connections to retain per host per credential.
-	// Defaults to 2.
+	// Defaults to 2. Zero or negative values disable idle pooling (short-lived connection mode).
 	MaxIdleConnsPerHost *int `yaml:"max-idle-conns-per-host,omitempty" json:"max-idle-conns-per-host,omitempty"`
 }
 
@@ -623,13 +650,11 @@ func (s OAuthModelSetting) GetMaxContextLength() int { return s.MaxContextLength
 // ResolveOAuthModelSetting finds the best matching OAuthModelSetting for a given model.
 // An exact Alias match on the model ID takes precedence over a general Name match.
 // Within the same match specificity, later entries in the slice override earlier ones.
-func ResolveOAuthModelSetting(settings []OAuthModelSetting, modelID, metadataModelID, modelName string) *OAuthModelSetting {
+func ResolveOAuthModelSetting(settings []OAuthModelSetting, modelID string, modelNames ...string) *OAuthModelSetting {
 	if len(settings) == 0 {
 		return nil
 	}
 	id := strings.ToLower(strings.TrimSpace(modelID))
-	metaID := strings.ToLower(strings.TrimSpace(metadataModelID))
-	name := strings.ToLower(strings.TrimSpace(modelName))
 
 	var aliasMatch *OAuthModelSetting
 	var nameMatch *OAuthModelSetting
@@ -644,7 +669,9 @@ func ResolveOAuthModelSetting(settings []OAuthModelSetting, modelID, metadataMod
 
 		if entryAlias != "" && id != "" && id == entryAlias {
 			aliasMatch = entry
-		} else if (entryAlias == "" || entryAlias == id) && (id == entryName || (metaID != "" && metaID == entryName) || (name != "" && name == entryName)) {
+		} else if entryAlias == "" && (id == entryName || slices.ContainsFunc(modelNames, func(name string) bool {
+			return strings.ToLower(strings.TrimSpace(name)) == entryName
+		})) {
 			nameMatch = entry
 		}
 	}
@@ -655,7 +682,7 @@ func ResolveOAuthModelSetting(settings []OAuthModelSetting, modelID, metadataMod
 	return nameMatch
 }
 
-// PayloadConfig defines default and override parameter rules applied to provider payloads.
+// PayloadConfig defines parameter and text mutation rules applied to provider payloads.
 type PayloadConfig struct {
 	// Default defines rules that only set parameters when they are missing in the payload.
 	Default []PayloadRule `yaml:"default" json:"default"`
@@ -665,6 +692,8 @@ type PayloadConfig struct {
 	Override []PayloadRule `yaml:"override" json:"override"`
 	// OverrideRaw defines rules that always set raw JSON values, overwriting any existing values.
 	OverrideRaw []PayloadRule `yaml:"override-raw" json:"override-raw"`
+	// Replace defines ordered literal and Go RE2 regex replacements in selected strings.
+	Replace []PayloadReplaceRule `yaml:"replace" json:"replace"`
 	// Filter defines rules that remove parameters from the payload by JSON path.
 	Filter []PayloadFilterRule `yaml:"filter" json:"filter"`
 }
@@ -727,6 +756,9 @@ type CloakConfig struct {
 
 	// SensitiveWordsReplace maps sensitive words or phrases to literal replacements.
 	SensitiveWordsReplace map[string]string `yaml:"sensitive-words-replace,omitempty" json:"sensitive-words-replace,omitempty"`
+
+	// SensitivePatternsReplace defines ordered Go RE2 regex replacement rules.
+	SensitivePatternsReplace []SensitivePatternRule `yaml:"sensitive-patterns-replace,omitempty" json:"sensitive-patterns-replace,omitempty"`
 
 	// CacheUserID controls whether Claude user_id values are cached per API key.
 	// When false, a fresh random user_id is generated for every request.

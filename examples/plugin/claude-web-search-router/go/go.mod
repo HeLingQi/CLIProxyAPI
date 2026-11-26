@@ -10,7 +10,10 @@ require (
 
 require (
 	github.com/sirupsen/logrus v1.10.2 // indirect
+	golang.org/x/net v0.63.0 // indirect
 	golang.org/x/sys v0.50.0 // indirect
 )
 
 replace github.com/router-for-me/CLIProxyAPI/v8 => ../../../..
+
+replace github.com/MoeForge/moego => github.com/router-for-me/moego v0.1.3

@@ -145,6 +145,9 @@ func TestClaudeExecutor_SupportsNativeToolSearch(t *testing.T) {
 			}
 		})
 	}
+	if NewKimiExecutor(&config.Config{}).SupportsNativeToolSearch(&cliproxyauth.Auth{}, "kimi-k2") {
+		t.Fatal("Kimi must never advertise native tool search")
+	}
 }
 
 func TestClaudeExecutor_NativeToolSearchOfficialSendsReferences(t *testing.T) {

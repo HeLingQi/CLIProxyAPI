@@ -27,6 +27,7 @@ func (s *Server) registerManagementV8Routes() {
 		v8.Handle(method, "/config/*path", s.mgmt.ConfigV8)
 	}
 
+	v8.GET("/server/server-id", s.mgmt.GetServerID)
 	v8.GET("/server/latest-version", s.mgmt.GetLatestVersion)
 	v8.POST("/requests/api-call", s.mgmt.APICall)
 	v8.POST("/routing/cooldown/reset", s.mgmt.ResetQuota)
@@ -47,6 +48,7 @@ func (s *Server) registerManagementV8Routes() {
 	v8.PUT("/observability/pricing/models", s.mgmt.PutPricingModel)
 	v8.POST("/observability/pricing/models/sync", s.mgmt.SyncPricingModels)
 	v8.DELETE("/observability/pricing/models", s.mgmt.DeletePricingModel)
+	v8.GET("/observability/requests/in-flight", s.mgmt.GetInFlightRequests)
 
 	v8.GET("/credentials", s.mgmt.ListAuthFiles)
 	v8.POST("/credentials", s.mgmt.UploadAuthFileV8)

@@ -140,7 +140,7 @@ func TestRegisterExecutorForAuth_OpenAICompatUsesNamespacedProviderKey(t *testin
 		{
 			name: "native first",
 			auths: []*coreauth.Auth{
-				{ID: "native-claude", Provider: "claude"},
+				{ID: "native-kimi", Provider: "kimi"},
 				openAICompatKimiAuth(),
 			},
 		},
@@ -148,7 +148,7 @@ func TestRegisterExecutorForAuth_OpenAICompatUsesNamespacedProviderKey(t *testin
 			name: "compat first",
 			auths: []*coreauth.Auth{
 				openAICompatKimiAuth(),
-				{ID: "native-claude", Provider: "claude"},
+				{ID: "native-kimi", Provider: "kimi"},
 			},
 		},
 	}
@@ -162,12 +162,12 @@ func TestRegisterExecutorForAuth_OpenAICompatUsesNamespacedProviderKey(t *testin
 
 			service.registerExecutorsForAuths(tt.auths, true)
 
-			nativeExecutor, okNative := service.coreManager.Executor("claude")
+			nativeExecutor, okNative := service.coreManager.Executor("kimi")
 			if !okNative {
-				t.Fatal("expected native claude executor")
+				t.Fatal("expected native kimi executor")
 			}
-			if _, okClaude := nativeExecutor.(*runtimeexecutor.ClaudeExecutor); !okClaude {
-				t.Fatalf("native executor type = %T, want *executor.ClaudeExecutor", nativeExecutor)
+			if _, okKimi := nativeExecutor.(*runtimeexecutor.KimiExecutor); !okKimi {
+				t.Fatalf("native executor type = %T, want *executor.KimiExecutor", nativeExecutor)
 			}
 
 			compatExecutor, okCompat := service.coreManager.Executor("openai-compatible-kimi")

@@ -277,7 +277,7 @@ func codexInputResultHasValidReasoningEncryptedContent(input ojson.Result) bool 
 			continue
 		}
 		rawSig := signature.SignaturePayloadWithoutProviderPrefix(encryptedContent.String())
-		if signature.IsValidGPTReasoningSignature(rawSig) || signature.IsValidGrokEncryptedContent(rawSig) {
+		if signature.IsValidGPTReasoningSignature(rawSig) || signature.IsValidMetaReasoningSignature(rawSig) || signature.IsValidGrokEncryptedContent(rawSig) {
 			return true
 		}
 	}
@@ -450,6 +450,9 @@ func canonicalCodexReasoningReplaySignatureKey(rawSignature string) string {
 	sig := signature.SignaturePayloadWithoutProviderPrefix(strings.TrimSpace(rawSignature))
 	if gptInfo, err := signature.InspectGPTReasoningSignature(sig); err == nil && gptInfo.RouterSuffix != "" {
 		return stripRouterSuffix(sig, gptInfo.RouterSuffix)
+	}
+	if metaInfo, err := signature.InspectMetaReasoningSignature(sig); err == nil && metaInfo.RouterSuffix != "" {
+		return stripRouterSuffix(sig, metaInfo.RouterSuffix)
 	}
 	if grokInfo, err := signature.InspectGrokEncryptedContent(sig); err == nil && grokInfo.RouterSuffix != "" {
 		return stripRouterSuffix(sig, grokInfo.RouterSuffix)

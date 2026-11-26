@@ -12,6 +12,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
+	"google.golang.org/protobuf/encoding/protowire"
 )
 
 func TestPayloadFinalizerDefaultsUseOriginalAndNormalizeBeforeRules(t *testing.T) {
@@ -27,6 +28,49 @@ func TestPayloadFinalizerDefaultsUseOriginalAndNormalizeBeforeRules(t *testing.T
 	out := FinalizePayload(WithPayloadFinalizer(context.Background(), finalize), body)
 	if ojson.GetBytes(out, "missing").String() != "user default" || ojson.GetBytes(out, "present").String() != "caller" || ojson.GetBytes(out, "late").Exists() || ojson.GetBytes(out, "tools.0.function.parameters.properties.count.type").String() != "number" {
 		t.Fatalf("unexpected final payload: %s", out)
+	}
+}
+
+func TestPayloadFinalizerDevinBusinessFieldsAndCredentials(t *testing.T) {
+	wire := BuildDevinGetChatMessageRequest("secret-token", "device", "model", "system", []DevinPrompt{{MessageID: "id", Source: 1, Content: "hello"}}, []DevinTool{{Name: "f", Parameters: []byte(`{"type":"object"}`)}}, nil, 1024, "session", "cascade", nil)
+	unchanged, _, errUnchanged := FinalizeDevinPayload(wire, func(body []byte) []byte { return body })
+	if errUnchanged != nil || !bytes.Equal(unchanged, wire) {
+		t.Fatalf("no-op changed protobuf: %v", errUnchanged)
+	}
+	final, view, errFinalize := FinalizeDevinPayload(wire, func(body []byte) []byte {
+		doc := ojson.NewDoc(body)
+		_ = doc.Delete("system_prompt")
+		_ = doc.Delete("tools")
+		_ = doc.Set("completion_config.max_tokens", 0)
+		_ = doc.Set("prompts.0.content", "configured")
+		return doc.Bytes()
+	})
+	if errFinalize != nil {
+		t.Fatal(errFinalize)
+	}
+	if ojson.GetBytes(view, "system_prompt").Exists() || ojson.GetBytes(view, "tools").Exists() {
+		t.Fatalf("filter undone: %s", view)
+	}
+	decoded, errDecode := decodeDevinPayload(final, devinPayloadFields)
+	if errDecode != nil {
+		t.Fatal(errDecode)
+	}
+	if decoded["completion_config"].(map[string]any)["max_tokens"] != uint64(0) {
+		t.Fatalf("default was re-injected: %v", decoded)
+	}
+	fieldOne := func(wire []byte) []byte {
+		for len(wire) > 0 {
+			num, kind, tagLen := protowire.ConsumeTag(wire)
+			n := protowire.ConsumeFieldValue(num, kind, wire[tagLen:])
+			if num == 1 {
+				return wire[:tagLen+n]
+			}
+			wire = wire[tagLen+n:]
+		}
+		return nil
+	}
+	if !bytes.Equal(fieldOne(wire), fieldOne(final)) {
+		t.Fatal("payload rules changed credentials")
 	}
 }
 
@@ -181,12 +225,21 @@ func TestExecutorHelpersDocCrossMethodPipelines(t *testing.T) {
 		if !SanitizeCodexInputItemIDsDoc(doc) {
 			t.Fatal("expected SanitizeCodexInputItemIDsDoc to mutate doc")
 		}
+		if !SanitizeMetaWebSearchToolsDoc(doc) {
+			t.Fatal("expected SanitizeMetaWebSearchToolsDoc to mutate doc")
+		}
+		if !EnsureMetaMuseToolNamespaceDoc(doc) {
+			t.Fatal("expected EnsureMetaMuseToolNamespaceDoc to mutate doc")
+		}
 		out := doc.Bytes()
 		if got := ojson.GetBytesNoCopy(out, "input.0.id").String(); got != "msg_bad_id" {
 			t.Fatalf("input.0.id = %q, want msg_bad_id", got)
 		}
 		if len(ojson.GetBytesNoCopy(out, "input").Array()) != 1 {
 			t.Fatalf("expected tool_search_call to be stripped: %s", out)
+		}
+		if ojson.GetBytesNoCopy(out, "tools.0.search_content_types").Exists() {
+			t.Fatalf("expected search_content_types to be stripped: %s", out)
 		}
 	})
 

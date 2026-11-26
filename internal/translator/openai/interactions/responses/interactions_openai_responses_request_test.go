@@ -1,10 +1,12 @@
 package responses
 
 import (
+	"bytes"
 	"os"
 	"strings"
 	"testing"
 
+	"github.com/MoeForge/moego/base64"
 	"github.com/MoeForge/moego/ojson"
 )
 
@@ -718,6 +720,121 @@ func TestConvertOpenAIResponsesRequestToInteractions_LogFilePayload(t *testing.T
 	}
 }
 
+func TestConvertOpenAIResponsesRequestToInteractions_DevinToolsFilterAndObfuscate(t *testing.T) {
+	responsesPayload := []byte(`{
+		"model": "devin/swe-2",
+		"tools": [
+			{
+				"type": "namespace",
+				"name": "mcp__codex_app",
+				"description": "Codex App tools",
+				"tools": [
+					{
+						"type": "function",
+						"name": "automation_update",
+						"description": "Recurring automations",
+						"parameters": {"type": "object", "properties": {"id": {"type": "string"}}}
+					},
+					{
+						"type": "function",
+						"name": "read_resource",
+						"description": "Read a resource",
+						"parameters": {"type": "object", "properties": {"uri": {"type": "string"}}}
+					}
+				]
+			},
+			{
+				"type": "function",
+				"name": "exec_command",
+				"description": "Runs a command in a bash shell, returning output or a session ID for ongoing interaction.",
+				"parameters": {
+					"type": "object",
+					"properties": {"cmd": {"type": "string"}},
+					"required": ["cmd"]
+				}
+			},
+			{
+				"type": "function",
+				"name": "write_stdin",
+				"description": "Writes characters to an existing unified exec session and returns recent output.",
+				"parameters": {
+					"type": "object",
+					"properties": {"session_id": {"type": "string"}},
+					"required": ["session_id"]
+				}
+			},
+			{
+				"type": "function",
+				"name": "other_func",
+				"description": "Regular function description",
+				"parameters": {"type": "object"}
+			}
+		],
+		"tool_choice": {
+			"type": "function",
+			"name": "automation_update",
+			"namespace": "mcp__codex_app"
+		},
+		"input": [
+			{"type": "message", "role": "user", "content": "hello"}
+		]
+	}`)
+
+	out, _ := ConvertOpenAIResponsesRequestToInteractions("devin/swe-2", responsesPayload, false)
+
+	tools := ojson.GetBytesNoCopy(out, "tools").Array()
+	toolNames := make([]string, 0, len(tools))
+	toolDescs := make(map[string]string)
+	for _, tool := range tools {
+		name := tool.Get("name").String()
+		toolNames = append(toolNames, name)
+		toolDescs[name] = tool.Get("description").String()
+	}
+
+	// 1. automation_update in mcp__codex_app must be filtered out
+	for _, name := range toolNames {
+		if strings.Contains(name, "automation_update") {
+			t.Fatalf("unexpected automation_update tool found in devin tools: %q", name)
+		}
+	}
+
+	// 2. other tool in mcp__codex_app must be preserved
+	if _, exists := toolDescs["mcp__codex_app__read_resource"]; !exists {
+		t.Fatalf("expected mcp__codex_app__read_resource in devin tools, got %v", toolNames)
+	}
+
+	// 3. exec_command description must have intentional grammar error "an session ID"
+	execDesc, ok := toolDescs["exec_command"]
+	if !ok {
+		t.Fatalf("expected exec_command in devin tools, got %v", toolNames)
+	}
+	const wantExecDesc = "Runs a command in a bash shell, returning output or an session ID for ongoing interaction."
+	if execDesc != wantExecDesc {
+		t.Fatalf("exec_command description = %q, want %q", execDesc, wantExecDesc)
+	}
+
+	// 4. write_stdin description must have intentional grammar error "to a existing"
+	stdinDesc, ok := toolDescs["write_stdin"]
+	if !ok {
+		t.Fatalf("expected write_stdin in devin tools, got %v", toolNames)
+	}
+	const wantStdinDesc = "Writes characters to a existing unified exec session and returns recent output."
+	if stdinDesc != wantStdinDesc {
+		t.Fatalf("write_stdin description = %q, want %q", stdinDesc, wantStdinDesc)
+	}
+
+	// 5. other_func description must remain untouched
+	otherDesc, ok := toolDescs["other_func"]
+	if !ok || otherDesc != "Regular function description" {
+		t.Fatalf("other_func description = %q, want Regular function description", otherDesc)
+	}
+
+	// 6. tool_choice targeting the filtered automation_update should not be set
+	if tc := ojson.GetBytesNoCopy(out, "generation_config.tool_choice"); tc.Exists() {
+		t.Fatalf("expected generation_config.tool_choice to be omitted for filtered tool, got %s", tc.Raw)
+	}
+}
+
 func TestConvertOpenAIResponsesRequestToInteractions_AntigravityDoesNotFilterDevinTools(t *testing.T) {
 	responsesPayload := []byte(`{
 		"model": "antigravity-preview-05-2026",
@@ -785,5 +902,52 @@ func TestConvertOpenAIResponsesRequestKeepsDevinSealedReasoning(t *testing.T) {
 	}
 	if got := ojson.GetBytesNoCopy(out, "input.2.type").String(); got != "function_call" {
 		t.Fatalf("foreign reasoning item must stay dropped, input.2.type = %q. Output: %s", got, string(out))
+	}
+}
+
+func TestConvertOpenAIResponsesRequestDevinGeminiThoughtSignature(t *testing.T) {
+	tink := append([]byte{0x01, 0x8f, 0x3d, 0x6b, 0x5f}, bytes.Repeat([]byte{0x5a}, 64)...)
+	sig := base64.StdEncoding.EncodeToString(tink)
+	doc := ojson.NewDocString(`{
+		"model":"devin/gemini-4-neon",
+		"input":[
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"go"}]},
+			{"type":"reasoning","summary":[{"type":"summary_text","text":"checked tool plan"}],"encrypted_content":""},
+			{"type":"reasoning","summary":[],"encrypted_content":""},
+			{"type":"reasoning","summary":[],"encrypted_content":""},
+			{"type":"function_call","name":"ping","call_id":"c1","arguments":"{}"}
+		]
+	}`)
+	_ = doc.Set("input.1.encrypted_content", sig)
+	_ = doc.Set("input.2.encrypted_content", "google#"+sig)
+	_ = doc.Set("input.3.encrypted_content", "claude#"+sig)
+	raw := doc.Bytes()
+
+	nonDevin, errNonDevin := convertOpenAIResponsesRequestToInteractions("devin/gemini-4-neon", raw, false, false)
+	if errNonDevin != nil {
+		t.Fatalf("convert without replayDevin: %v", errNonDevin)
+	}
+	if got := ojson.GetBytesNoCopy(nonDevin, "input.1.type").String(); got != "function_call" {
+		t.Fatalf("without replayDevin, Gemini reasoning must be dropped; input.1.type = %q. Output: %s", got, string(nonDevin))
+	}
+
+	devinOut, errDevin := convertOpenAIResponsesRequestToInteractions("devin/gemini-4-neon", raw, false, true)
+	if errDevin != nil {
+		t.Fatalf("convert with replayDevin: %v", errDevin)
+	}
+	if got := ojson.GetBytesNoCopy(devinOut, "input.1.type").String(); got != "thought" {
+		t.Fatalf("with replayDevin, input.1.type = %q, want thought. Output: %s", got, string(devinOut))
+	}
+	if got := ojson.GetBytesNoCopy(devinOut, "input.1.signature").String(); got != sig {
+		t.Fatalf("signature = %q, want %q. Output: %s", got, sig, string(devinOut))
+	}
+	if got := ojson.GetBytesNoCopy(devinOut, "input.1.signature_type").String(); got != "gemini" {
+		t.Fatalf("signature_type = %q, want gemini. Output: %s", got, string(devinOut))
+	}
+	if got := ojson.GetBytesNoCopy(devinOut, "input.1.content.0.text").String(); got != "checked tool plan" {
+		t.Fatalf("thought text = %q, want %q", got, "checked tool plan")
+	}
+	if got := ojson.GetBytesNoCopy(devinOut, "input.2.type").String(); got != "function_call" {
+		t.Fatalf("prefixed signatures must stay dropped, input.2.type = %q. Output: %s", got, string(devinOut))
 	}
 }

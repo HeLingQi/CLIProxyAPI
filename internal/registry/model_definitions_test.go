@@ -1,9 +1,11 @@
 package registry
 
 import (
-	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/MoeForge/moego/json"
 )
 
 func TestCodexConfigurationUpdateCapability(t *testing.T) {
@@ -78,6 +80,15 @@ func TestGetStaticModelDefinitionsByChannelSupportsGeminiInteractions(t *testing
 	}
 }
 
+func TestGetStaticModelDefinitionsByChannelSupportsKimiAndKimiAI(t *testing.T) {
+	for _, channel := range []string{"kimi", "kimi-ai", "kimi.ai", "kimi.com"} {
+		models := GetStaticModelDefinitionsByChannel(channel)
+		if len(models) == 0 {
+			t.Fatalf("GetStaticModelDefinitionsByChannel(%s) returned no models", channel)
+		}
+	}
+}
+
 func TestModelOverrideHeadersFromEmbeddedModels(t *testing.T) {
 	const wantUA = "codex-tui/0.154.0 (Mac OS 26.5.2; arm64) iTerm.app/3.6.11 (codex-tui; 0.154.0)"
 	got := ModelOverrideHeaders("gpt-5.6-luna")
@@ -111,6 +122,154 @@ func TestGeminiVertexModelsUseFlashLiteReleaseID(t *testing.T) {
 	t.Fatalf("Vertex models do not contain %q", releaseID)
 }
 
+func TestWithXAIBuiltinsIncludesImage20(t *testing.T) {
+	models := WithXAIBuiltins(nil)
+	for _, model := range models {
+		if model != nil && model.ID == xaiBuiltinImage20ModelID {
+			if model.Created != 1786060800 {
+				t.Fatalf("created = %d, want 1786060800 (2026-08-07)", model.Created)
+			}
+			return
+		}
+	}
+	t.Fatalf("expected xAI builtin model %s", xaiBuiltinImage20ModelID)
+}
+
+func TestWithXAIBuiltinsIncludesSpeechModels(t *testing.T) {
+	models := WithXAIBuiltins(nil)
+	found := map[string]*ModelInfo{}
+	for _, model := range models {
+		if model == nil {
+			continue
+		}
+		if model.ID == xaiBuiltinSpeechModelID || model.ID == xaiBuiltinSpeechVoiceModelID {
+			found[model.ID] = model
+		}
+	}
+	for _, id := range []string{xaiBuiltinSpeechModelID, xaiBuiltinSpeechVoiceModelID} {
+		model := found[id]
+		if model == nil {
+			t.Fatalf("expected xAI builtin model %s", id)
+		}
+		if model.OwnedBy != "xai" || model.Type != "xai" {
+			t.Fatalf("%s owned_by/type = %s/%s, want xai/xai", id, model.OwnedBy, model.Type)
+		}
+	}
+}
+
+func TestWithXAIBuiltinsIncludesVideo15GAAndPreviewAlias(t *testing.T) {
+	models := WithXAIBuiltins(nil)
+	foundGA := false
+	foundPreviewAlias := false
+
+	for _, model := range models {
+		if model == nil {
+			continue
+		}
+		if model.ID == xaiBuiltinVideo15ModelID {
+			foundGA = true
+		}
+		if model.ID == xaiBuiltinVideo15PreviewID {
+			foundPreviewAlias = true
+		}
+	}
+
+	if !foundGA {
+		t.Fatalf("expected xAI builtin model %s", xaiBuiltinVideo15ModelID)
+	}
+	if !foundPreviewAlias {
+		t.Fatalf("expected xAI builtin compatibility alias %s", xaiBuiltinVideo15PreviewID)
+	}
+}
+
+func TestGetXAIModelsPreservesVideo15LiteAfterCatalogRefresh(t *testing.T) {
+	const liteID = "grok-imagine-video-1.5-lite"
+	original := getModels()
+	t.Cleanup(func() {
+		modelsCatalogStore.mu.Lock()
+		modelsCatalogStore.data = original
+		modelsCatalogStore.mu.Unlock()
+	})
+
+	refreshed := *original
+	remoteModel := &ModelInfo{ID: "refreshed-xai-model", OwnedBy: "xai", Type: "xai", DisplayName: "Refreshed model"}
+	refreshed.XAI = []*ModelInfo{remoteModel}
+	payload, err := json.Marshal(&refreshed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := publishCatalogBytes(payload); err != nil {
+		t.Fatalf("publish catalog without Lite: %v", err)
+	}
+
+	models := GetXAIModels()
+	foundLite, foundRemote := false, false
+	for _, model := range models {
+		if model.ID == liteID {
+			foundLite = true
+			if model.OwnedBy != "xai" || model.Type != "xai" ||
+				!reflect.DeepEqual(model.SupportedInputModalities, []string{"text", "image"}) ||
+				!reflect.DeepEqual(model.SupportedOutputModalities, []string{"video"}) {
+				t.Fatalf("Lite lost xAI video capabilities after catalog refresh: %#v", model)
+			}
+		}
+		if model.ID == remoteModel.ID {
+			foundRemote = true
+			if !reflect.DeepEqual(model, remoteModel) {
+				t.Fatalf("refreshed model = %#v, want %#v", model, remoteModel)
+			}
+		}
+	}
+	if !foundLite || !foundRemote {
+		t.Fatalf("catalog lost Lite or refreshed model: Lite=%v, refreshed=%v", foundLite, foundRemote)
+	}
+
+	const clientID = "test-xai-lite-catalog-refresh"
+	registryRef := GetGlobalRegistry()
+	registryRef.RegisterClient(clientID, "xai", models)
+	t.Cleanup(func() { registryRef.UnregisterClient(clientID) })
+	if !registryRef.ClientSupportsModel(clientID, liteID) {
+		t.Fatal("xAI credential registration lost Lite support after catalog refresh")
+	}
+	if providers := registryRef.GetModelProviders(liteID); !reflect.DeepEqual(providers, []string{"xai"}) {
+		t.Fatalf("Lite providers = %v, want [xai]", providers)
+	}
+}
+
+func TestWithXAIBuiltinsReplacesVideo15LiteWithoutMutatingCatalog(t *testing.T) {
+	const liteID = "grok-imagine-video-1.5-lite"
+	stale := &ModelInfo{ID: liteID, DisplayName: "Stale Lite", SupportedInputModalities: []string{"text"}}
+	duplicate := &ModelInfo{ID: " GROK-IMAGINE-VIDEO-1.5-LITE ", DisplayName: "Duplicate Lite"}
+	custom := &ModelInfo{ID: "custom-xai-model", DisplayName: "Custom model"}
+	input := []*ModelInfo{stale, custom, duplicate}
+	for range 2 {
+		models := WithXAIBuiltins(input)
+		liteCount := 0
+		foundCustom := false
+		for _, model := range models {
+			if strings.EqualFold(strings.TrimSpace(model.ID), liteID) {
+				liteCount++
+				if model.ID != liteID || model.DisplayName != "Grok Imagine Video 1.5 Lite" ||
+					!reflect.DeepEqual(model.SupportedInputModalities, []string{"text", "image"}) {
+					t.Fatalf("Lite builtin did not replace stale metadata: %#v", model)
+				}
+				model.SupportedInputModalities[0] = "mutated"
+			}
+			if model.ID == custom.ID {
+				foundCustom = reflect.DeepEqual(model, custom)
+			}
+		}
+		if liteCount != 1 || !foundCustom {
+			t.Fatalf("Lite count = %d, custom preserved = %v, want 1 and true", liteCount, foundCustom)
+		}
+	}
+	if input[0] != stale || input[1] != custom || input[2] != duplicate ||
+		stale.DisplayName != "Stale Lite" || !reflect.DeepEqual(stale.SupportedInputModalities, []string{"text"}) ||
+		duplicate.ID != " GROK-IMAGINE-VIDEO-1.5-LITE " || duplicate.DisplayName != "Duplicate Lite" {
+		t.Fatal("builtin merge mutated the input catalog")
+	}
+}
+
 func TestAntigravityWebSearchModelForRequiresRequestedModelCapability(t *testing.T) {
 	registryRef := GetGlobalRegistry()
 	registryRef.RegisterClient("test-antigravity-websearch-route", "antigravity", []*ModelInfo{
@@ -140,6 +299,41 @@ func TestAntigravityWebSearchModelForRequiresRequestedModelCapability(t *testing
 	}
 	if got := AntigravityWebSearchModelFor("unknown-model"); got != "" {
 		t.Fatalf("unknown model should not get Antigravity web search model, got %q", got)
+	}
+}
+
+func TestValidateModelsCatalog_Meta(t *testing.T) {
+	valid := &staticModelsJSON{
+		Meta: []*ModelInfo{
+			{ID: "muse-spark-1.3"},
+		},
+	}
+	if err := validateModelsCatalog(valid); err != nil {
+		t.Fatalf("expected valid Meta catalog to pass, got: %v", err)
+	}
+
+	withNull := &staticModelsJSON{
+		Meta: []*ModelInfo{nil},
+	}
+	if err := validateModelsCatalog(withNull); err == nil {
+		t.Fatal("expected error for Meta section with null model, got nil")
+	}
+
+	withEmptyID := &staticModelsJSON{
+		Meta: []*ModelInfo{{ID: " "}},
+	}
+	if err := validateModelsCatalog(withEmptyID); err == nil {
+		t.Fatal("expected error for Meta section with empty model id, got nil")
+	}
+
+	withDuplicate := &staticModelsJSON{
+		Meta: []*ModelInfo{
+			{ID: "muse-spark-1.3"},
+			{ID: "muse-spark-1.3"},
+		},
+	}
+	if err := validateModelsCatalog(withDuplicate); err == nil {
+		t.Fatal("expected error for Meta section with duplicate model id, got nil")
 	}
 }
 
@@ -186,5 +380,85 @@ func TestWithCodexBuiltinsIncludesImage25And26Models(t *testing.T) {
 		if model.Created != 1704067200 {
 			t.Errorf("model %s Created = %d, want 1704067200", id, model.Created)
 		}
+	}
+}
+
+func TestGetDevinModelsFallback(t *testing.T) {
+	devinModels := GetDevinModels()
+	if len(devinModels) == 0 {
+		t.Fatal("GetDevinModels() returned empty list")
+	}
+
+	foundSWE2 := false
+	foundFable := false
+	foundGemini38 := false
+	foundGrok46 := false
+	foundDeepSeekV4Flash := false
+	foundDeepSeekV41Flash := false
+	for _, m := range devinModels {
+		if m != nil && m.ID == "swe-2" {
+			foundSWE2 = true
+			if m.Type != "devin" {
+				t.Errorf("swe-2 Type = %q, want devin", m.Type)
+			}
+		}
+		if m != nil && m.ID == "claude-fable-5-1" {
+			foundFable = true
+		}
+		if m != nil && m.ID == "gemini-3-8-flash" {
+			foundGemini38 = true
+			if m.OwnedBy != "google" {
+				t.Errorf("gemini-3-8-flash OwnedBy = %q, want google", m.OwnedBy)
+			}
+		}
+		if m != nil && m.ID == "grok-4-6" {
+			foundGrok46 = true
+			if m.OwnedBy != "xai" {
+				t.Errorf("grok-4-6 OwnedBy = %q, want xai", m.OwnedBy)
+			}
+		}
+		if m != nil && m.ID == "deepseek-v4-flash" {
+			foundDeepSeekV4Flash = true
+			if m.OwnedBy != "deepseek" {
+				t.Errorf("deepseek-v4-flash OwnedBy = %q, want deepseek", m.OwnedBy)
+			}
+		}
+		if m != nil && m.ID == "deepseek-v4-1-flash-1017" {
+			foundDeepSeekV41Flash = true
+			if m.OwnedBy != "deepseek" {
+				t.Errorf("deepseek-v4-1-flash-1017 OwnedBy = %q, want deepseek", m.OwnedBy)
+			}
+		}
+	}
+	if !foundSWE2 {
+		t.Error("expected swe-2 in GetDevinModels()")
+	}
+	if !foundFable {
+		t.Error("expected claude-fable-5-1 in GetDevinModels()")
+	}
+	if !foundGemini38 {
+		t.Error("expected gemini-3-8-flash in GetDevinModels()")
+	}
+	if !foundGrok46 {
+		t.Error("expected grok-4-6 in GetDevinModels()")
+	}
+	if !foundDeepSeekV4Flash {
+		t.Error("expected deepseek-v4-flash in GetDevinModels()")
+	}
+	if !foundDeepSeekV41Flash {
+		t.Error("expected deepseek-v4-1-flash-1017 in GetDevinModels()")
+	}
+
+	byChannel := GetStaticModelDefinitionsByChannel("devin")
+	if len(byChannel) == 0 {
+		t.Fatal("GetStaticModelDefinitionsByChannel(\"devin\") returned empty list")
+	}
+
+	info := LookupStaticModelInfo("devin/swe-2")
+	if info == nil {
+		t.Fatal("LookupStaticModelInfo(\"devin/swe-2\") = nil, want valid model")
+	}
+	if info.DisplayName != "SWE-2" {
+		t.Errorf("info.DisplayName = %q, want SWE-2", info.DisplayName)
 	}
 }

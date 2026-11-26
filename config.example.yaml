@@ -18,9 +18,15 @@ config-version: 8
 models:
   catalog: ""
   codex-catalog: ""
+  devin-catalog: ""
 
 # Listener, TLS, network discovery, and server operation.
 server:
+  # Deployment UUID. Leave empty to generate and save one on the first valid startup.
+  # The value is normalized to lowercase; a read-only file uses a generated ID for
+  # this process only. Reuse the persisted value across restarts and shared storage.
+  server-id: ""
+
   # Server host/interface to bind to. Default is empty ("") to bind all interfaces (IPv4 + IPv6).
   # Use "127.0.0.1" or "localhost" to restrict access to local machine only.
   host: ""
@@ -55,6 +61,14 @@ server:
   # trusted-proxies:
   #   - 127.0.0.1
   #   - 192.0.2.0/24
+
+  # Graceful shutdown drain budget, in seconds. When the process receives SIGINT/SIGTERM,
+  # in-flight HTTP requests are allowed to finish for up to this many seconds before
+  # remaining connections are forcibly closed. Shutdown never hangs longer than this budget.
+  # Default 0 keeps the legacy behavior: close immediately without draining.
+  # Note: hijacked connections (WebSocket sessions) are not drained; they are
+  # released by their own connection managers after the drain window.
+  shutdown-timeout: 0
 
   # TLS settings for HTTPS. When enabled, the server listens with the provided certificate and key.
   tls:
@@ -312,6 +326,11 @@ requests:
   #             - "metadata.disable_payload"
   #       params: # JSON path (gjson/sjson syntax) -> value
   #         "generationConfig.thinkingConfig.thinkingBudget": 32768
+  #     - models:
+  #         - name: "muse-*"
+  #           protocol: "meta"
+  #       params:
+  #         prompt_cache_retention: "24h" # opt into Meta's 24h prompt cache when the client omits prompt_cache_retention
   #   default-raw: # Default raw rules set parameters using raw JSON when missing (must be valid JSON).
   #     - models:
   #         - name: "gemini-2.5-pro" # Supports wildcards (e.g., "gemini-*")
@@ -342,6 +361,45 @@ requests:
   #           protocol: "codex" # restricts the rule to a specific protocol, options: openai, gemini, claude, codex, antigravity, meta
   #       params: # JSON path (gjson/sjson syntax) -> raw JSON value (strings are used as-is, must be valid JSON)
   #         "response_format": "{\"type\":\"json_schema\",\"json_schema\":{\"name\":\"answer\",\"schema\":{\"type\":\"object\"}}}"
+  #   replace: # Ordered literal and Go RE2 regex replacements in existing strings; runs after overrides, before filter.
+  #     - models:
+  #         - name: "*"
+  #           protocol: "claude"
+  #           from-protocol: "openai"
+  #       target:
+  #         role: user # system, developer, or user
+  #         positions: [1, 2] # One-based positions of the selected role in the final upstream body; missing positions are skipped.
+  #         # all: true      # Select all messages of this role instead of positions (mutually exclusive).
+  #       replacements: # Each entry is either {"source": "destination"} (literal) or {pattern, replacement} (Go RE2 regex; $1/${1} expand captures).
+  #         - "you are hero": "you are fool"
+  #         - "remove this phrase": ""
+  #         - pattern: '(?i)\bhero\b'
+  #           replacement: "friend"
+  #         - pattern: '(?s)<debug>.*?</debug>'
+  #           replacement: ""
+  #       # Invalid regex entries are skipped with an index-only warning; other replacements still run.
+  #       # Role targets process text blocks separately; assistant replies, images, tools, and thinking are not modified.
+  #       # Supported layouts: OpenAI Chat, Claude, Responses/Codex, Gemini, and Antigravity.
+  #       # system includes Claude system, Gemini systemInstruction, and Responses instructions (each counts as one message, before any system messages).
+  #       # developer merged into system during translation must be selected as system.
+  #       # Matching uses final upstream roles, not the original client roles.
+  #     - models:
+  #         - name: "*"
+  #           protocol: "codex"
+  #       target:
+  #         paths: # Alternative to role/positions/all (mutually exclusive); paths are relative to the provider payload root.
+  #           - 'tools.#(type=="function")#.description'
+  #           - "metadata.description"
+  #       replacements: # Same ordered literal and Go RE2 regex rules as role targets; $1/${1} expand captures.
+  #         - "old name": "new name"
+  #         - "remove this phrase": ""
+  #         - pattern: '(?i)user-(\d+)'
+  #           replacement: 'account-${1}'
+  #         - pattern: '(?s)<debug>.*?</debug>'
+  #           replacement: ""
+  #       # Invalid regex entries are skipped with an index-only warning; other replacements still run.
+  #       # Path targets edit only existing string nodes, regardless of role or field; missing/non-string nodes are skipped.
+  #       # Objects/arrays are not traversed recursively; duplicate resolved paths are replaced once per rule.
   #   filter: # Filter rules remove specified parameters from the payload.
   #     - models:
   #         - name: "gemini-2.5-pro" # Supports wildcards (e.g., "gemini-*")
@@ -566,6 +624,11 @@ upstream:
     #   # the caller's value and never synthesizes one, "off" never sends the header.
     #   client-request-id: "on"
 
+  xai:
+    # When true, inject the native x_search tool when the request does not declare it.
+    # The injected tool is also added to tool_choice.allowed_tools when applicable.
+    inject-x-search: false
+
 # API-key upstreams are separate from access.api-keys (client authentication).
 # Each provider contains named groups: one base-url, shared settings, and a keys list.
 # Add another group for another endpoint; base-url belongs to the group, not a key.
@@ -689,6 +752,11 @@ upstream:
 #       prefix: "test"                              # optional: require calls like "test/vertex-pro" to target this credential
 #       disable-cooling: false                       # optional override: true disables cooling, false enables it; omit to inherit global
 #       request-retry: 3                             # optional per-auth override; 0 disables additional rounds; omit or set < 0 to inherit global
+#       request-scoped-errors:                       # optional: custom rules to classify upstream errors by status and body patterns
+#         - status: 400
+#           match:
+#             - "invalid_argument"
+#           action: "stop"
 #       base-url: "https://example.com/api"         # optional, e.g. https://zenmux.ai/api; falls back to Google Vertex when omitted
 #       proxy-url: "socks5://proxy.example.com:1080" # optional per-key proxy override
 #       # proxy-url: "direct" # optional: explicit direct connect for this credential
@@ -831,13 +899,16 @@ upstream:
 #               - "proxy"
 #             sensitive-words-replace:     # optional: literal sensitive-word replacements ("target": "replacement")
 #               "Claude Code": "Claude"
+#             sensitive-patterns-replace:  # optional: ordered Go RE2 regex replacements ("replacement": "" deletes matches)
+#               - pattern: '(?m)^You are omp[^\n]*\n?'
+#                 replacement: ""
 #             cache-user-id: true          # optional: default is false; set true to reuse cached user_id per API key instead of generating a random one each request
 #             # Every custom tool on a cloaked OAuth request automatically uses a caller-stable opaque mcp__<server>__<tool> alias.
 #
 #           # fingerprint-profile (optional, top-level on this api-keys.claude key entry; not a cloak sub-field):
 #           # OAuth and API-key fingerprints are different contracts.
 #           #   - Real Claude OAuth stays on the strict Claude Code CLI wire fingerprint.
-#           #   - API keys (official Anthropic, custom gateways) stay loose and
+#           #   - API keys (official Anthropic, custom gateways, Kimi) stay loose and
 #           #     caller-owned unless this field is set.
 #           #
 #           # Default (omit / empty): keep the caller request fingerprint and headers.
@@ -858,14 +929,15 @@ upstream:
 #           #                         delegated OAuth providers use stable auth ID instead of
 #           #                         rotating access tokens. "oauth-cli" is a legacy alias.
 #           #
-#           # count_tokens keeps the native model/messages/tools shape for every origin.
-#           # It does not send billing/CCH, currentDate, metadata, or diagnostics.
+#           # count_tokens keeps the native model/messages/tools shape for every origin, including
+#           # Kimi opt-in. It does not send billing/CCH, currentDate, metadata, or diagnostics.
 #           #
 #           # CCH: the billing block may carry a per-request cch hash. CPA emits it exactly where
 #           # Claude Code does, which is api.anthropic.com (first-party) and Vertex only. An opt-in
-#           # on any other gateway still sends the billing block, but without cch,
+#           # on any other gateway (including Kimi) still sends the billing block, but without cch,
 #           # so a per-request hash cannot bust that gateway's prompt cache. api.anthropic.com
-#           # strips the block itself (0 tokens, no cache impact).
+#           # strips the block itself (0 tokens, no cache impact). Kimi drops the whole block by
+#           # default and keeps it, unsigned, after an explicit fingerprint opt-in.
 #           # A real Claude OAuth credential always signs, on every upstream: a downstream Claude
 #           # Code pointed at CPA cannot produce that value itself.
 #           #
@@ -878,13 +950,76 @@ upstream:
 #           #         cloak:
 #           #           mode: "always"   # recommended when upstream rejects non-CLI clients
 #           #
-#           # Delegated Anthropic Messages OAuth files use "fingerprint_profile"
-#           # in the auth JSON. Refresh keeps it.
+#           # Delegated Anthropic Messages OAuth files (Kimi, etc.) use "fingerprint_profile"
+#           # in the auth JSON. Refresh keeps it. Example:
+#           #   {
+#           #     "type": "kimi",
+#           #     "access_token": "...",
+#           #     "refresh_token": "...",
+#           #     "fingerprint_profile": "claude-code-cli"
+#           #   }
 #           #   Legacy "fingerprint-profile" credentials remain supported and are normalized at load time.
 #           # fingerprint-profile: "claude-code-cli" # optional api-keys.claude key field; default is empty (caller-owned); uncomment to opt in
 #           experimental-cch-signing: false # deprecated compatibility field; CCH is generated automatically
 #                                           # for real Claude OAuth on any upstream, and for claude-code-cli profiles
 #                                           # only on api.anthropic.com; Vertex keeps provider-native signing
+#
+#   # xAI API keys
+#   # Uses the native xAI executor, including its Responses namespace-tool handling.
+#
+#   xai:
+#     - name: xai-1
+#       prefix: "xai" # optional: require calls like "xai/grok-4.5" to target this credential
+#       disable-cooling: false # optional override: true disables cooling, false enables it; omit to inherit global
+#       request-retry: 3 # optional per-auth override; 0 disables additional rounds; omit or set < 0 to inherit global
+#       request-scoped-errors: # optional: custom rules to classify upstream errors by status and body patterns
+#         - status: 400
+#           match:
+#             - "rate_limit_exceeded"
+#           action: "continue-and-cooldown"
+#       base-url: "https://api.x.ai/v1" # xAI-compatible Responses API endpoint
+#       headers:
+#         X-Custom-Header: "custom-value"
+#         # Values starting with "$" dynamically copy the header value from downstream client requests.
+#         # If the client did not send the specified header, the header is omitted.
+#         # X-Claude-Code-Session-Id: "$ABC" # copies client's "ABC" header
+#       proxy-url: "socks5://proxy.example.com:1080" # optional: per-key proxy override
+#       # proxy-url: "direct" # optional: explicit direct connect for this credential
+#       models:
+#         - name: "grok-4.5"       # upstream model name
+#           alias: "grok-latest"   # client alias mapped to the upstream model
+#           display-name: "Grok Latest" # optional catalog display name
+#           max-context-length: 1048576 # optional: override Codex client context window metadata
+#           force-mapping: true     # optional: rewrite response model fields back to the alias
+#           is-compat: false        # optional: preserve thinking blocks with empty signatures for compatible upstreams
+#           thinking:               # optional: exact thinking capability for this configured model
+#             levels: ["xhigh", "high", "medium", "low"]
+#       excluded-models:
+#         - "grok-4.1"             # exclude specific models (exact match)
+#         - "grok-3-*"             # wildcard matching prefix
+#       keys:
+#         - api-key: "xai-..."
+#           weight: 5 # optional: weighted-round-robin share; omitted defaults to 1; maximum 1,000,000
+#           websockets: true # optional: use the xAI upstream websocket transport for downstream websocket requests
+#
+#   # Meta API keys (Muse Code)
+#   # Uses the native Meta executor targeting https://api.meta.ai/v1.
+#
+#   meta:
+#     - name: meta-1
+#       prefix: "meta" # optional: require calls like "meta/muse-spark-1.3" to target this credential
+#       disable-cooling: false # optional override: true disables cooling, false enables it; omit to inherit global
+#       request-retry: 3 # optional per-auth override; 0 disables additional rounds; omit or set < 0 to inherit global
+#       base-url: "https://api.meta.ai/v1" # optional: defaults to https://api.meta.ai/v1
+#       proxy-url: "socks5://proxy.example.com:1080" # optional: per-key proxy override
+#       models:
+#         - name: "muse-spark-1.3" # upstream model name
+#           alias: "muse-latest"   # client alias mapped to the upstream model
+#       excluded-models:
+#         - "muse-spark-1.1"
+#       keys:
+#         - api-key: "..."
+#           weight: 5 # optional: weighted-round-robin share; omitted defaults to 1; maximum 1,000,000
 #
 #   # OpenAI compatibility providers
 #
@@ -955,7 +1090,7 @@ oauth:
 
   # Global OAuth model name aliases (per channel)
   # These aliases rename model IDs for both model listing and request routing.
-  # Supported channels: vertex, aistudio, antigravity, claude, codex.
+  # Supported channels include vertex, aistudio, antigravity, claude, codex, kimi, xai, meta, copilot, and devin.
   # NOTE: These aliases do not apply to any of the upstream groups under api-keys.
   # NOTE: Because aliases affect the merged /v1 model list and merged request routing, overlapping
   # client-visible names can become ambiguous across providers. For strict backend pinning, use
@@ -996,14 +1131,35 @@ oauth:
   #   codex:
   #     - name: "gpt-5"
   #       alias: "g5"
+  #   kimi:
+  #     - name: "kimi-k2.5"
+  #       alias: "k2.5"
+  #   xai:
+  #     - name: "grok-4.3"
+  #       alias: "grok-latest"
+  #   meta:
+  #     - name: "muse-spark-1.3"
+  #       alias: "muse-latest"
+  #   copilot:
+  #     - name: "copilot/claude-sonnet-5" # use the listed Copilot model ID, before any auth prefix
+  #       alias: "copilot-sonnet" # published verbatim; no automatic copilot/ prefix
+  #   devin:
+  #     - name: "devin/claude-fable-5-1" # use the listed Devin model ID, before any auth prefix
+  #       alias: "devin-fable"
   #   sample-provider:                  # plugin provider keys are supported for OAuth plugins
   #     - name: "sample-model-latest"
   #       alias: "sample-latest"
 
   # OAuth provider model settings (per channel)
   # Allows overriding model-level capabilities (such as context window) for OAuth credentials.
-  # Supported channels: vertex, aistudio, antigravity, claude, codex.
+  # Supported channels include vertex, aistudio, antigravity, claude, codex, kimi, xai, meta, copilot, and devin.
   # settings:
+  #   copilot:
+  #     - name: "copilot/gpt-5.3-codex" # canonical source ID, shared by its aliases
+  #       max-context-length: 131072
+  #     - name: "copilot/gpt-5.3-codex"
+  #       alias: "coding" # exact public alias before any credential prefix
+  #       max-context-length: 262144
   #   codex:
   #     - name: "gpt-6-sol"
   #       max-context-length: 524288 # overrides context window advertised to Codex clients
@@ -1027,6 +1183,16 @@ oauth:
   #     - "claude-3-5-haiku-20241022"
   #   codex:
   #     - "gpt-5-codex-mini"
+  #   kimi:
+  #     - "kimi-k2-thinking"
+  #   xai:
+  #     - "grok-3-mini"
+  #   meta:
+  #     - "muse-spark-1.1"
+  #   copilot:
+  #     - "copilot/claude-haiku-*" # match Copilot model IDs before aliases and auth prefixes
+  #   devin:
+  #     - "devin/swe-2-flash" # match Devin model IDs before aliases and auth prefixes
 
   # OAuth provider request-scoped error rules (custom error classification for OAuth credentials)
   # request-scoped-errors:
@@ -1059,6 +1225,27 @@ oauth:
   #       match:
   #         - "context_window_exceeded"
   #       action: "stop"
+  #   kimi:
+  #     - status: 400
+  #       match:
+  #         - "length_limit"
+  #       action: "stop"
+  #   xai:
+  #     - status: 400
+  #       match:
+  #         - "max_tokens_exceeded"
+  #       action: "stop"
+  #   meta:
+  #     - status: 400
+  #       match:
+  #         - "context_length_exceeded"
+  #       action: "stop"
+  #   copilot:
+  #     - status: 400
+  #       match:
+  #         - "context_length_exceeded"
+  #       action: "stop"
+
   # Provider options below apply to OAuth/file-backed credentials.
   # API-key credentials use their own group/key options.
   providers:
@@ -1066,10 +1253,18 @@ oauth:
       # When true, enable authentication for the WebSocket API (/v1/ws).
       ws-auth: true
 
+    # Claude OAuth login behavior.
+    # claude:
+    #   # Include the org:create_api_key scope during new Claude OAuth logins (default: true).
+    #   # Set to false to request only the five user:* scopes (note: claude.ai may require org:create_api_key).
+    #   oauth-include-create-api-key: true
+
     # Codex provider behavior.
     codex:
       # Terminate and relay Codex Live WebRTC audio and DataChannel traffic in this process.
       # This requires inbound UDP reachability. Keep disabled to preserve direct media behavior.
+      # On Solaris and illumos, leave this disabled: in-process media relay is unsupported.
+      # Enabling it returns HTTP 503 for call setup; direct SDP forwarding and sideband work when disabled.
       live-media-relay:
         enabled: false
         # Maximum concurrent media sessions. Zero uses the default of 32.
@@ -1113,10 +1308,17 @@ oauth:
       #   - "proxy"
       # sensitive-words-replace:      # optional: literal sensitive-word replacements ("target": "replacement") in system instructions
       #   "You are Codex, an agent based on GPT-5.": "You are a helpful coding assistant."
+      # sensitive-patterns-replace:   # optional: ordered Go RE2 regex replacements in system instructions (deleting flagged text with "" is recommended over obfuscation for Antigravity)
+      #   - pattern: '(?m)^RFC 2119[^\n]*\n?'
+      #     replacement: ""
+      #   - pattern: '(?s)<system[-_](conventions|directive)>.*?</system[-_](conventions|directive)>\n?'
+      #     replacement: ""
       # connection-pool:              # optional: upstream HTTP connection pool settings
       #   enabled: false             # whether to enable connection pooling (default: false)
       #   idle-conn-timeout: "30s"    # idle keep-alive timeout (default: 30s, capped at 210s)
-      #   max-idle-conns-per-host: 2  # max idle connections per host per credential (default: 2)
+      #   max-idle-conns-per-host: 2  # max idle connections per host per credential (default: 2; <= 0 disables idle pooling)
+      # tos-pause-window: "0"         # optional: pool-wide protective pause after the first 403 TOS_VIOLATION
+                                    # (default "0" = disabled; set a positive duration such as "6h" to enable pool-wide pause)
       # Use credits as a last resort after free-tier Claude quota is exhausted.
       antigravity-credits: true
 
@@ -1129,6 +1331,17 @@ oauth:
       # When true, validates full Claude protobuf tree (Field 2 -> Field 1 structure).
       # When false (default), only checks R/E prefix + base64 + first byte 0x12.
       # signature-bypass-strict: false
+
+    # Devin provider behavior.
+    # devin:
+    #   sensitive-words:             # optional: words to remove matching lines in system prompts
+    #     - "API"
+    #     - "proxy"
+    #   sensitive-words-replace:     # optional: literal sensitive-word replacements ("target": "replacement") in system prompts
+    #     "Claude Code": "Claude"
+    #   sensitive-patterns-replace:  # optional: ordered Go RE2 regex replacements in system prompts ("replacement": "" deletes matches)
+    #     - pattern: '(?m)^You are omp[^\n]*\n?'
+    #       replacement: ""
 
 # Image and video behavior.
 multimedia:

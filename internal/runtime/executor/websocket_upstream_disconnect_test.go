@@ -20,6 +20,12 @@ func TestWebsocketActivationAfterUpstreamDisconnect(t *testing.T) {
 				NewCodexWebsocketsExecutor(nil).readUpstreamLoop(sess, conn)
 			},
 		},
+		{
+			name: "xai",
+			readLoop: func(sess *codexWebsocketSession, conn *websocket.Conn) {
+				NewXAIWebsocketsExecutor(nil).readUpstreamLoop(sess, conn)
+			},
+		},
 	}
 
 	for _, test := range tests {

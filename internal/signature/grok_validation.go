@@ -65,8 +65,8 @@ func InspectGrokEncryptedContent(raw string) (*GrokEncryptedContentInfo, error) 
 	native := sig
 	routerSuffix := ""
 	if head, tail, ok := strings.Cut(sig, "."); ok {
-		if !isValidRouterSuffix(tail) {
-			return nil, fmt.Errorf("invalid Grok encrypted_content: router suffix must be 1-%d alphanumeric characters", maxRouterSuffixLen)
+		if !isValidMetaRouterSuffix(tail) {
+			return nil, fmt.Errorf("invalid Grok encrypted_content: router suffix must be 1-%d alphanumeric characters", maxMetaRouterSuffixLen)
 		}
 		native = head
 		routerSuffix = tail
@@ -86,6 +86,9 @@ func InspectGrokEncryptedContent(raw string) (*GrokEncryptedContentInfo, error) 
 		if strings.HasPrefix(native, "gAAAA") {
 			return nil, fmt.Errorf("Grok encrypted_content looks like GPT/Codex reasoning signature")
 		}
+		if IsValidMetaReasoningSignature(native) {
+			return nil, fmt.Errorf("Grok encrypted_content looks like Meta reasoning signature")
+		}
 		if IsValidClaudeThinkingSignature(native, ClaudeSignatureValidationOptions{Strict: true}) {
 			return nil, fmt.Errorf("Grok encrypted_content looks like Claude thinking signature")
 		}
@@ -96,6 +99,16 @@ func InspectGrokEncryptedContent(raw string) (*GrokEncryptedContentInfo, error) 
 			return nil, fmt.Errorf("Grok encrypted_content looks like Gemini thoughtSignature")
 		}
 	}
+	// Kimi emits no envelope either, so the pre-filter above cannot narrow it and
+	// this check has to run unconditionally. Length is the only separator the two
+	// families have: Kimi is fixed at two code-path constants while xAI payload
+	// length tracks reasoning volume continuously at 1-byte granularity. Neither
+	// observed Kimi length appears anywhere in 1027 catalogued signatures or 215
+	// native Grok samples, so rejecting them here costs no real Grok traffic.
+	if IsValidKimiThinkingSignature(native) {
+		return nil, fmt.Errorf("Grok encrypted_content has a Kimi thinking signature length")
+	}
+
 	decoded, err := decodeGrokEncryptedContent(native)
 	if err != nil {
 		return nil, err

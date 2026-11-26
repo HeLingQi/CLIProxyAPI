@@ -4,8 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
-	"encoding/json"
-	"github.com/MoeForge/moego/base64"
 	"io"
 	"net"
 	"net/http"
@@ -16,6 +14,9 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/MoeForge/moego/base64"
+	"github.com/MoeForge/moego/json"
 
 	"github.com/gorilla/websocket"
 	codexauth "github.com/router-for-me/CLIProxyAPI/v8/internal/auth/codex"
@@ -1382,6 +1383,7 @@ func TestCodexExecutorCodexClientIgnoresUseSIWC(t *testing.T) {
 		"codex_cli_rs/0.154.0 (Mac OS 26.5.2; arm64)",
 		"codex-tui/0.154.0 (Mac OS 26.5.2; arm64) iTerm.app/3.6.11 (codex-tui; 0.154.0)",
 		"codex_exec/0.153.2 (Mac OS 26.6.2; arm64)",
+		"@agentclientprotocol/codex-acp/0.166.0 (Mac OS 27.2.0; arm64) unknown (@agentclientprotocol/codex-acp; 2.6.0)",
 	}
 
 	for _, ua := range codexUserAgents {

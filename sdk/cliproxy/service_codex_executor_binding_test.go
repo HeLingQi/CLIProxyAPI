@@ -10,6 +10,7 @@ import (
 	"github.com/gorilla/websocket"
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/watcher"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
@@ -82,6 +83,8 @@ func TestSyncPluginModelRuntime_UnrelatedAuthDoesNotReplaceWebsocketExecutor(t *
 	}{
 		{name: "codex standard mode", provider: "codex"},
 		{name: "codex home mode", provider: "codex", homeEnabled: true},
+		{name: "xai standard mode", provider: "xai"},
+		{name: "xai home mode", provider: "xai", homeEnabled: true},
 	}
 
 	for _, tt := range testCases {
@@ -142,6 +145,103 @@ func TestSyncPluginModelRuntime_UnrelatedAuthDoesNotReplaceWebsocketExecutor(t *
 	}
 }
 
+func TestEnsureExecutorsForAuth_XAIDoesNotReplaceInNormalMode(t *testing.T) {
+	service := &Service{
+		cfg:         &config.Config{},
+		coreManager: coreauth.NewManager(nil, nil, nil),
+	}
+	auth := &coreauth.Auth{
+		ID:       "xai-auth-1",
+		Provider: "xai",
+		Status:   coreauth.StatusActive,
+	}
+
+	service.ensureExecutorsForAuth(auth)
+	firstExecutor, okFirst := service.coreManager.Executor("xai")
+	if !okFirst || firstExecutor == nil {
+		t.Fatal("expected xai executor after first bind")
+	}
+	if _, isXAIAutoExecutor := firstExecutor.(*executor.XAIAutoExecutor); !isXAIAutoExecutor {
+		t.Fatalf("xai executor type = %T, want *executor.XAIAutoExecutor", firstExecutor)
+	}
+
+	service.ensureExecutorsForAuth(auth)
+	secondExecutor, okSecond := service.coreManager.Executor("xai")
+	if !okSecond || secondExecutor == nil {
+		t.Fatal("expected xai executor after second bind")
+	}
+	if firstExecutor != secondExecutor {
+		t.Fatal("expected xai executor to stay unchanged in normal mode")
+	}
+}
+
+func TestEnsureExecutorsForAuthWithMode_XAIForceReplace(t *testing.T) {
+	service := &Service{
+		cfg:         &config.Config{},
+		coreManager: coreauth.NewManager(nil, nil, nil),
+	}
+	auth := &coreauth.Auth{
+		ID:       "xai-auth-2",
+		Provider: "xai",
+		Status:   coreauth.StatusActive,
+	}
+
+	service.ensureExecutorsForAuth(auth)
+	firstExecutor, okFirst := service.coreManager.Executor("xai")
+	if !okFirst || firstExecutor == nil {
+		t.Fatal("expected xai executor after first bind")
+	}
+
+	service.ensureExecutorsForAuthWithMode(auth, true)
+	secondExecutor, okSecond := service.coreManager.Executor("xai")
+	if !okSecond || secondExecutor == nil {
+		t.Fatal("expected xai executor after forced rebind")
+	}
+	if firstExecutor == secondExecutor {
+		t.Fatal("expected xai executor replacement in force mode")
+	}
+	if _, isXAIAutoExecutor := secondExecutor.(*executor.XAIAutoExecutor); !isXAIAutoExecutor {
+		t.Fatalf("xai executor type = %T, want *executor.XAIAutoExecutor", secondExecutor)
+	}
+}
+
+func TestEnsureExecutorsForAuth_XAIReplacesExecutorAfterConfigUpdate(t *testing.T) {
+	service := &Service{
+		cfg:         &config.Config{},
+		coreManager: coreauth.NewManager(nil, nil, nil),
+		pluginHost:  pluginhost.New(),
+	}
+	t.Cleanup(func() {
+		sdkAuth.RegisterPluginAuthParser(nil)
+		sdktranslator.SetPluginHooks(nil)
+	})
+	auth := &coreauth.Auth{
+		ID:       "xai-auth-config-update",
+		Provider: "xai",
+		Status:   coreauth.StatusActive,
+	}
+
+	service.ensureExecutorsForAuth(auth)
+	firstExecutor, okFirst := service.coreManager.Executor("xai")
+	if !okFirst || firstExecutor == nil {
+		t.Fatal("expected xai executor before config update")
+	}
+
+	service.applyWatcherConfigUpdate(&config.Config{})
+	service.ensureExecutorsForAuth(auth)
+
+	secondExecutor, okSecond := service.coreManager.Executor("xai")
+	if !okSecond || secondExecutor == nil {
+		t.Fatal("expected xai executor after config update")
+	}
+	if firstExecutor == secondExecutor {
+		t.Fatal("expected stale xai executor replacement after config update")
+	}
+	if _, isXAIAutoExecutor := secondExecutor.(*executor.XAIAutoExecutor); !isXAIAutoExecutor {
+		t.Fatalf("xai executor type = %T, want *executor.XAIAutoExecutor", secondExecutor)
+	}
+}
+
 func TestApplyWatcherConfigUpdate_PreservesExistingWebsocketConnections(t *testing.T) {
 	testCases := []struct {
 		name     string
@@ -149,6 +249,7 @@ func TestApplyWatcherConfigUpdate_PreservesExistingWebsocketConnections(t *testi
 		model    string
 	}{
 		{name: "codex", provider: "codex", model: "gpt-6-astra"},
+		{name: "xai", provider: "xai", model: "grok-4.6"},
 	}
 
 	for _, tt := range testCases {
@@ -298,5 +399,41 @@ func TestApplyWatcherConfigUpdate_PreservesExistingWebsocketConnections(t *testi
 				t.Fatal("expected new session after config hot reload to use new proxy configuration and fail to dial 127.0.0.1:1")
 			}
 		})
+	}
+}
+
+func TestRegisterExecutorsForAuths_DisabledXAIDoesNotSkipSubsequentForceReplace(t *testing.T) {
+	initialCfg := &config.Config{}
+	reloadedCfg := &config.Config{}
+	service := &Service{
+		cfg:         initialCfg,
+		coreManager: coreauth.NewManager(nil, nil, nil),
+	}
+	disabledAuth := &coreauth.Auth{
+		ID:       "xai-disabled",
+		Provider: "xai",
+		Disabled: true,
+	}
+	activeAuth := &coreauth.Auth{
+		ID:       "xai-active",
+		Provider: "xai",
+		Status:   coreauth.StatusActive,
+	}
+
+	service.ensureExecutorsForAuth(activeAuth)
+	firstExecutor, okFirst := service.coreManager.Executor("xai")
+	if !okFirst || firstExecutor == nil {
+		t.Fatal("expected initial xai executor")
+	}
+
+	service.cfg = reloadedCfg
+	service.registerExecutorsForAuths([]*coreauth.Auth{disabledAuth, activeAuth}, true)
+
+	secondExecutor, okSecond := service.coreManager.Executor("xai")
+	if !okSecond || secondExecutor == nil {
+		t.Fatal("expected xai executor after force replace")
+	}
+	if firstExecutor == secondExecutor {
+		t.Fatal("expected active xai auth after disabled xai auth to replace executor")
 	}
 }

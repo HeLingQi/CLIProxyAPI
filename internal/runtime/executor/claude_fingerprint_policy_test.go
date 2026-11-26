@@ -682,6 +682,190 @@ func TestClaudeExecutor_ClaudeCodeCLIFingerprintCountTokensKeepsNativeShape(t *t
 	}
 }
 
+func TestKimiExecutor_ClaudeMessagesWithAndWithoutClaudeCodeCLIFingerprint(t *testing.T) {
+	var seenBodies [][]byte
+	var seenHeaders []http.Header
+	var mu sync.Mutex
+	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", kimiRoundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		body, _ := io.ReadAll(req.Body)
+		mu.Lock()
+		seenBodies = append(seenBodies, body)
+		seenHeaders = append(seenHeaders, req.Header.Clone())
+		mu.Unlock()
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body: io.NopCloser(strings.NewReader(
+				`{"id":"msg_test","type":"message","role":"assistant","model":"k2.5","content":[{"type":"text","text":"hello"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`,
+			)),
+		}, nil
+	}))
+
+	executor := NewKimiExecutor(&config.Config{})
+	payload := []byte(`{"model":"kimi-k2.5(max)","max_tokens":32,"messages":[{"role":"user","content":"hello"}]}`)
+
+	// 1. Default Kimi OAuth: no fingerprint injection.
+	defaultAuth := &cliproxyauth.Auth{
+		ID:         "kimi-auth-default",
+		Provider:   "kimi",
+		Attributes: map[string]string{},
+		Metadata:   map[string]any{"access_token": "test-token"},
+	}
+	_, errDefault := executor.Execute(ctx, defaultAuth, cliproxyexecutor.Request{
+		Model:   "kimi-k2.5(max)",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat:    sdktranslator.FormatClaude,
+		OriginalRequest: payload,
+		Headers: http.Header{
+			"Anthropic-Beta": []string{"kimi-caller-beta"},
+			"User-Agent":     []string{"kimi-caller/1.0"},
+		},
+	})
+	if errDefault != nil {
+		t.Fatalf("default Execute() error = %v", errDefault)
+	}
+
+	// 2. Kimi OAuth with fingerprint_profile: "claude-code-cli": opts into Claude Code CLI fingerprint.
+	fpAuth := &cliproxyauth.Auth{
+		ID:         "kimi-auth-profile",
+		Provider:   "kimi",
+		Attributes: map[string]string{},
+		Metadata: map[string]any{
+			"access_token":        "test-token",
+			"fingerprint_profile": "claude-code-cli",
+		},
+	}
+	_, errFP := executor.Execute(ctx, fpAuth, cliproxyexecutor.Request{
+		Model:   "kimi-k2.5(max)",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat:    sdktranslator.FormatClaude,
+		OriginalRequest: payload,
+	})
+	if errFP != nil {
+		t.Fatalf("fingerprint Execute() error = %v", errFP)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(seenBodies) != 2 {
+		t.Fatalf("expected 2 captured requests, got %d", len(seenBodies))
+	}
+
+	// Default Kimi preserves caller fingerprint headers and strips billing/CCH.
+	if got := ojson.GetBytes(seenBodies[0], "metadata.user_id").String(); got != "" {
+		t.Fatalf("default Kimi request should not have metadata.user_id: %q", got)
+	}
+	if strings.Contains(string(seenBodies[0]), "cch=") || strings.Contains(string(seenBodies[0]), "x-anthropic-billing-header:") {
+		t.Fatalf("default Kimi request should not have billing/CCH: %s", seenBodies[0])
+	}
+	if got := claudeFingerprintHeaderValue(seenHeaders[0], "Anthropic-Beta"); got != "kimi-caller-beta" {
+		t.Fatalf("default Kimi Anthropic-Beta = %q, want caller beta", got)
+	}
+	if got := claudeFingerprintHeaderValue(seenHeaders[0], "User-Agent"); got != "kimi-caller/1.0" {
+		t.Fatalf("default Kimi User-Agent = %q, want caller value", got)
+	}
+
+	// Opt-in Kimi requests use the complete CLI fingerprint. Kimi is not a native
+	// cch origin, so the billing header goes out unsigned, exactly as native does
+	// against a non-first-party base URL.
+	userID := ojson.GetBytes(seenBodies[1], "metadata.user_id").String()
+	if !helps.IsValidUserID(userID) {
+		t.Fatalf("opt-in Kimi metadata.user_id = %q, want valid synthesized user_id", userID)
+	}
+	if got := ojson.Get(userID, "account_uuid").String(); got == "" {
+		t.Fatal("opt-in Kimi request should have non-empty synthesized account_uuid")
+	}
+	billing := ojson.GetBytes(seenBodies[1], "system.0.text").String()
+	if !strings.HasPrefix(billing, "x-anthropic-billing-header:") {
+		t.Fatalf("opt-in Kimi request must carry Claude billing attribution: %s", seenBodies[1])
+	}
+	if strings.Contains(billing, "cch=") {
+		t.Fatalf("opt-in Kimi billing = %q, want no cch off first-party origins", billing)
+	}
+	betas := claudeFingerprintHeaderValue(seenHeaders[1], "Anthropic-Beta")
+	if !strings.Contains(betas, "oauth-2025-04-20") || !strings.Contains(betas, "extended-cache-ttl-2025-04-11") {
+		t.Fatalf("opt-in Kimi Anthropic-Beta = %q, want full OAuth CLI beta set", betas)
+	}
+}
+
+func TestKimiExecutor_ClaudeCodeCLIProfileKeepsUnsignedBillingAndNativeCountTokens(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		run  func(context.Context, *KimiExecutor, *cliproxyauth.Auth, []byte) error
+	}{
+		{name: "stream", run: func(ctx context.Context, executor *KimiExecutor, auth *cliproxyauth.Auth, payload []byte) error {
+			result, errStream := executor.ExecuteStream(ctx, auth, cliproxyexecutor.Request{Model: "kimi-k2.5(max)", Payload: payload}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude, OriginalRequest: payload})
+			if errStream != nil {
+				return errStream
+			}
+			for chunk := range result.Chunks {
+				if chunk.Err != nil {
+					return chunk.Err
+				}
+			}
+			return nil
+		}},
+		{name: "count tokens", run: func(ctx context.Context, executor *KimiExecutor, auth *cliproxyauth.Auth, payload []byte) error {
+			_, errCount := executor.CountTokens(ctx, auth, cliproxyexecutor.Request{Model: "kimi-k2.5(max)", Payload: payload}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude, OriginalRequest: payload})
+			return errCount
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var seenBody []byte
+			var seenHeaders http.Header
+			ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", kimiRoundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				seenBody, _ = io.ReadAll(req.Body)
+				seenHeaders = req.Header.Clone()
+				if strings.Contains(req.URL.Path, "count_tokens") {
+					return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(`{"input_tokens":7}`))}, nil
+				}
+				stream := "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_test\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"k2.5\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+				return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: io.NopCloser(strings.NewReader(stream))}, nil
+			}))
+			auth := &cliproxyauth.Auth{
+				ID:         "kimi-profile-" + test.name,
+				Provider:   "kimi",
+				Attributes: map[string]string{},
+				Metadata: map[string]any{
+					"access_token":        "test-token",
+					"fingerprint_profile": "claude-code-cli",
+				},
+			}
+			payload := []byte(`{"model":"kimi-k2.5(max)","max_tokens":32,"messages":[{"role":"user","content":"hello"}]}`)
+			if errRun := test.run(ctx, NewKimiExecutor(&config.Config{}), auth, payload); errRun != nil {
+				t.Fatalf("request error = %v", errRun)
+			}
+			betas := claudeFingerprintHeaderValue(seenHeaders, "Anthropic-Beta")
+			if test.name == "count tokens" {
+				for _, field := range []string{"system", "metadata", "context_management", "diagnostics"} {
+					if got := ojson.GetBytes(seenBody, field); got.Exists() {
+						t.Fatalf("count_tokens %s = %s, want absent", field, got.Raw)
+					}
+				}
+				if strings.Contains(string(seenBody), "cch=") || strings.Contains(string(seenBody), "currentDate") {
+					t.Fatalf("count_tokens must keep the native shape without CCH/currentDate: %s", seenBody)
+				}
+				if want := claudeCountTokensBetasForCredential(true); betas != want {
+					t.Fatalf("Anthropic-Beta = %q, want count_tokens CLI set %q", betas, want)
+				}
+				return
+			}
+			billing := ojson.GetBytes(seenBody, "system.0.text").String()
+			if !strings.HasPrefix(billing, "x-anthropic-billing-header:") {
+				t.Fatalf("upstream body is missing opt-in billing attribution: %s", seenBody)
+			}
+			if strings.Contains(billing, "cch=") {
+				t.Fatalf("opt-in Kimi billing = %q, want no cch off first-party origins", billing)
+			}
+			if !strings.Contains(betas, "oauth-2025-04-20") || !strings.Contains(betas, "extended-cache-ttl-2025-04-11") {
+				t.Fatalf("Anthropic-Beta = %q, want full OAuth CLI beta set", betas)
+			}
+		})
+	}
+}
+
 // The custom-header escape hatch must have the same scope in caller-owned mode as
 // it has on the CLI path: a non-streaming third-party gateway keeps operator
 // overrides, while api.anthropic.com and streaming requests claw them back.
@@ -812,6 +996,56 @@ func TestClaudeExecutor_CallerOwnedForwardsCallerUserAgent(t *testing.T) {
 	}
 }
 
+// Without a profile opt-in the caller owns its count_tokens body. A caller that
+// deliberately sends context_management expects the returned count to reflect it,
+// so CPA must not quietly reshape the request into the CLI contract.
+func TestKimiExecutor_DefaultCountTokensRespectsCallerBody(t *testing.T) {
+	var seenBody []byte
+	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", kimiRoundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		seenBody, _ = io.ReadAll(req.Body)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"input_tokens":7}`)),
+		}, nil
+	}))
+	auth := &cliproxyauth.Auth{
+		ID:         "kimi-default-count-tokens",
+		Provider:   "kimi",
+		Attributes: map[string]string{},
+		Metadata:   map[string]any{"access_token": "test-token"},
+	}
+	payload := []byte(`{"model":"kimi-k2.5(max)","system":"caller system","messages":[{"role":"user","content":"hello"}],"metadata":{"user_id":"caller-user"},"context_management":{"edits":[]}}`)
+	if _, errCount := NewKimiExecutor(&config.Config{}).CountTokens(ctx, auth,
+		cliproxyexecutor.Request{Model: "kimi-k2.5(max)", Payload: payload},
+		cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude, OriginalRequest: payload}); errCount != nil {
+		t.Fatalf("CountTokens() error = %v", errCount)
+	}
+	if len(seenBody) == 0 {
+		t.Fatal("expected an upstream count_tokens request")
+	}
+	// Positive pins first: assert the request really arrived for this model, so the
+	// preservation assertions below cannot pass vacuously.
+	if got := ojson.GetBytes(seenBody, "model").String(); got == "" {
+		t.Fatalf("upstream model is empty: %s", seenBody)
+	}
+	if got := ojson.GetBytes(seenBody, "messages.#").Int(); got != 1 {
+		t.Fatalf("upstream messages length = %d, want 1: %s", got, seenBody)
+	}
+	for _, field := range []string{"system", "metadata", "context_management"} {
+		if !ojson.GetBytes(seenBody, field).Exists() {
+			t.Fatalf("default count_tokens dropped caller-owned %q: %s", field, seenBody)
+		}
+	}
+	if got := ojson.GetBytes(seenBody, "metadata.user_id").String(); got != "caller-user" {
+		t.Fatalf("metadata.user_id = %q, want the caller value preserved", got)
+	}
+	// Default mode must not add the CLI billing/CCH attribution either.
+	if strings.Contains(string(seenBody), "x-anthropic-billing-header:") || strings.Contains(string(seenBody), "cch=") {
+		t.Fatalf("default count_tokens must not inject billing/CCH: %s", seenBody)
+	}
+}
+
 // api.anthropic.com rejects metadata/context_management/diagnostics on
 // count_tokens regardless of profile, so upstream compatibility still strips them
 // for an unprofiled first-party API key.
@@ -844,6 +1078,95 @@ func TestClaudeExecutor_DefaultCountTokensStillStripsAnthropicRejectedFields(t *
 		if got := ojson.GetBytes(seenBody, field); got.Exists() {
 			t.Fatalf("api.anthropic.com count_tokens %s = %s, want stripped", field, got.Raw)
 		}
+	}
+}
+
+func TestKimiExecutor_ClaudeCodeCLIIdentitySurvivesAccessTokenRotation(t *testing.T) {
+	var seenBodies [][]byte
+	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", kimiRoundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		body, _ := io.ReadAll(req.Body)
+		seenBodies = append(seenBodies, body)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"id":"msg_test","type":"message","role":"assistant","model":"k2.5","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`)),
+		}, nil
+	}))
+	payload := []byte(`{"model":"kimi-k2.5(max)","max_tokens":32,"messages":[{"role":"user","content":"hello"}]}`)
+	for _, token := range []string{"token-before-refresh", "token-after-refresh"} {
+		auth := &cliproxyauth.Auth{
+			ID:         "stable-kimi-auth",
+			Provider:   "kimi",
+			Attributes: map[string]string{},
+			Metadata: map[string]any{
+				"access_token":        token,
+				"fingerprint_profile": "claude-code-cli",
+			},
+		}
+		if _, errExecute := NewKimiExecutor(&config.Config{}).Execute(ctx, auth, cliproxyexecutor.Request{
+			Model:   "kimi-k2.5(max)",
+			Payload: payload,
+		}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude, OriginalRequest: payload}); errExecute != nil {
+			t.Fatalf("Execute(%q) error = %v", token, errExecute)
+		}
+	}
+	if len(seenBodies) != 2 {
+		t.Fatalf("captured %d requests, want 2", len(seenBodies))
+	}
+	firstUserID := ojson.GetBytes(seenBodies[0], "metadata.user_id").String()
+	secondUserID := ojson.GetBytes(seenBodies[1], "metadata.user_id").String()
+	for _, field := range []string{"account_uuid", "device_id"} {
+		if first, second := ojson.Get(firstUserID, field).String(), ojson.Get(secondUserID, field).String(); first == "" || first != second {
+			t.Fatalf("%s changed across access token refresh: %q vs %q", field, first, second)
+		}
+	}
+}
+
+func TestStripDefaultKimiClaudeCodeAttributionRespectsProfile(t *testing.T) {
+	t.Parallel()
+
+	body := []byte(`{"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.220; cch=abcde;"},{"type":"text","text":"Keep this rule."}],"messages":[]}`)
+	kimiAuth := &cliproxyauth.Auth{Provider: "kimi"}
+	if got := stripDefaultKimiClaudeCodeAttribution(kimiAuth, "https://api.kimi.com/coding/v1/messages", false, body); strings.Contains(string(got), "cch=") || !strings.Contains(string(got), "Keep this rule.") {
+		t.Fatalf("default Kimi stripping produced %s", got)
+	}
+	if got := stripDefaultKimiClaudeCodeAttribution(kimiAuth, "https://api.kimi.com/coding/v1/messages", true, body); !strings.Contains(string(got), "cch=abcde") {
+		t.Fatalf("profiled Kimi request lost caller CCH: %s", got)
+	}
+}
+
+func TestKimiExecutor_StripsCallerClaudeCodeCCH(t *testing.T) {
+	var seenBody []byte
+	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", kimiRoundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		seenBody, _ = io.ReadAll(req.Body)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body: io.NopCloser(strings.NewReader(
+				`{"id":"msg_test","type":"message","role":"assistant","model":"k2.5","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`,
+			)),
+		}, nil
+	}))
+	payload := []byte(`{"model":"kimi-k2.5(max)","max_tokens":32,"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.220; cch=abcde;"},{"type":"text","text":"Keep this rule."}],"messages":[{"role":"user","content":"hello"}]}`)
+	_, errExecute := NewKimiExecutor(&config.Config{}).Execute(ctx, &cliproxyauth.Auth{
+		Provider:   "kimi",
+		Attributes: map[string]string{},
+		Metadata:   map[string]any{"access_token": "test-token"},
+	}, cliproxyexecutor.Request{
+		Model:   "kimi-k2.5(max)",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat:    sdktranslator.FormatClaude,
+		OriginalRequest: payload,
+	})
+	if errExecute != nil {
+		t.Fatalf("Execute() error = %v", errExecute)
+	}
+	if strings.Contains(string(seenBody), "cch=") || strings.Contains(string(seenBody), "x-anthropic-billing-header:") {
+		t.Fatalf("Kimi upstream body still has Claude CCH attribution: %s", seenBody)
+	}
+	if !strings.Contains(string(seenBody), "Keep this rule.") {
+		t.Fatalf("Kimi upstream body dropped caller system text: %s", seenBody)
 	}
 }
 

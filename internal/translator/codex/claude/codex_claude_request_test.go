@@ -45,6 +45,24 @@ func TestConvertClaudeRequestToCodex_MaxOutputTokens(t *testing.T) {
 	}
 }
 
+func TestConvertClaudeRequestToCodex_DefaultsMissingToolInputToEmptyObject(t *testing.T) {
+	input := []byte(`{"model":"test-model","messages":[{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"get_time"}]}]}`)
+
+	out, errConvert := ConvertClaudeRequestToCodex("test-model", input, false)
+	if errConvert != nil {
+		t.Fatalf("ConvertClaudeRequestToCodex() error = %v", errConvert)
+	}
+
+	functionCall := ojson.GetBytesNoCopy(out, `input.#(type=="function_call")`)
+	arguments := functionCall.Get("arguments")
+	if arguments.Type != ojson.String {
+		t.Fatalf("function_call.arguments type = %v, want string; item=%s", arguments.Type, functionCall.Raw)
+	}
+	if got := arguments.String(); got != "{}" {
+		t.Fatalf("function_call.arguments = %q, want %q; item=%s", got, "{}", functionCall.Raw)
+	}
+}
+
 func TestConvertClaudeRequestToCodex_SystemMessageScenarios(t *testing.T) {
 	tests := []struct {
 		name             string
@@ -747,6 +765,83 @@ func TestConvertClaudeRequestToCodex_AssistantGrokSignatureToReasoningItem(t *te
 	}
 	if got := reasoning.Get("encrypted_content").String(); got != signature {
 		t.Fatalf("encrypted_content = %q, want Grok signature", got)
+	}
+}
+
+func testMetaClaudeSignature() string {
+	// Shape-valid synthetic Meta envelope; no captured value is embedded.
+	signature := "Q-PaDgE"
+	for len(signature) < 1426 {
+		signature += "A"
+	}
+	return signature
+}
+
+func TestConvertClaudeRequestToCodex_AssistantMetaSignatureToReasoningItem(t *testing.T) {
+	signature := testMetaClaudeSignature()
+	payload := []byte(`{"model":"muse-spark-1.3","messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"summary","signature":""},{"type":"text","text":"answer"}]},{"role":"user","content":"next"}]}`)
+	payload, _ = ojson.SetBytes(payload, "messages.0.content.0.signature", signature)
+
+	out, _ := ConvertClaudeRequestToCodex("muse-spark-1.3", payload, false)
+	reasoning := ojson.GetBytesNoCopy(out, "input.0")
+	if reasoning.Get("type").String() != "reasoning" {
+		t.Fatalf("input.0 type = %q, want reasoning; output=%s", reasoning.Get("type").String(), out)
+	}
+	if got := reasoning.Get("encrypted_content").String(); got != signature {
+		t.Fatalf("encrypted_content = %q, want Meta signature", got)
+	}
+}
+
+func TestConvertClaudeRequestToCodex_IgnoresMetaSignatureForNonMetaTargets(t *testing.T) {
+	signature := testMetaClaudeSignature()
+	payload := []byte(`{"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"summary","signature":""},{"type":"text","text":"answer"}]},{"role":"user","content":"next"}]}`)
+	payload, _ = ojson.SetBytes(payload, "messages.0.content.0.signature", signature)
+
+	for _, modelName := range []string{"gpt-5.4", "claude-sonnet-4-6", "grok-4.5"} {
+		t.Run(modelName, func(t *testing.T) {
+			out, _ := ConvertClaudeRequestToCodex(modelName, payload, false)
+			if got := countRequestInputItemsByType(out, "reasoning"); got != 0 {
+				t.Fatalf("got %d reasoning items for non-Meta target, want 0; output=%s", got, out)
+			}
+		})
+	}
+}
+
+func TestConvertClaudeRequestToCodex_AssistantRoutedMetaSignatureToReasoningItem(t *testing.T) {
+	// OpenRouter serves Meta Muse models and appends a dot-delimited
+	// alphanumeric suffix to the native envelope; the full value must replay
+	// verbatim.
+	signature := testMetaClaudeSignature() + "." + strings.Repeat("Ab3", 23)[:67]
+	payload := []byte(`{"model":"meta/muse-wonder","messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"summary","signature":""},{"type":"text","text":"answer"}]},{"role":"user","content":"next"}]}`)
+	payload, _ = ojson.SetBytes(payload, "messages.0.content.0.signature", signature)
+
+	out, _ := ConvertClaudeRequestToCodex("meta/muse-wonder", payload, false)
+	reasoning := ojson.GetBytesNoCopy(out, "input.0")
+	if reasoning.Get("type").String() != "reasoning" {
+		t.Fatalf("input.0 type = %q, want reasoning; output=%s", reasoning.Get("type").String(), out)
+	}
+	if got := reasoning.Get("encrypted_content").String(); got != signature {
+		t.Fatalf("encrypted_content = %q, want routed Meta signature verbatim", got)
+	}
+
+	out, _ = ConvertClaudeRequestToCodex("gpt-5.4", payload, false)
+	if got := countRequestInputItemsByType(out, "reasoning"); got != 0 {
+		t.Fatalf("got %d reasoning items for non-Meta target, want 0; output=%s", got, out)
+	}
+
+	// A foreign GPT signature must not be replayed when the target is a Meta Muse model.
+	gptPayload := []byte(`{"model":"muse-spark-1.3","messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"summary","signature":""},{"type":"text","text":"answer"}]},{"role":"user","content":"next"}]}`)
+	gptPayload, _ = ojson.SetBytes(gptPayload, "messages.0.content.0.signature", validCodexReasoningSignature())
+	out, _ = ConvertClaudeRequestToCodex("muse-spark-1.3", gptPayload, false)
+	if got := countRequestInputItemsByType(out, "reasoning"); got != 0 {
+		t.Fatalf("got %d reasoning items for GPT signature on Meta target, want 0; output=%s", got, out)
+	}
+
+	// When modelName is an unmapped upstream deployment alias, the client-requested
+	// Meta Muse model in the payload preserves Meta signatures.
+	aliasOut, _ := ConvertClaudeRequestToCodex("deployment-123", payload, false)
+	if got := countRequestInputItemsByType(aliasOut, "reasoning"); got != 1 {
+		t.Fatalf("got %d reasoning items for aliased Meta target, want 1; output=%s", got, aliasOut)
 	}
 }
 
@@ -2013,4 +2108,255 @@ func TestConvertClaudeRequestToCodex_StandaloneToolReferenceAndSearchResultOrder
 	if shortLong == "" || shortLong == longDeferredTool || !strings.Contains(outArr[1].Get("text").String(), shortLong) {
 		t.Fatalf("expected shortened tool name %q in mixed tool_result input_text, got: %s", shortLong, outArr[1].Raw)
 	}
+}
+
+func TestConvertClaudeRequestToCodex_ToolResultMediaDocumentAndURLImage(t *testing.T) {
+	t.Run("array text and pdf document", func(t *testing.T) {
+		inputJSON := `{
+			"model": "gpt-5",
+			"messages": [
+				{"role": "assistant", "content": [{"type": "tool_use", "id": "call_pdf", "name": "read_file", "input": {}}]},
+				{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_pdf", "content": [
+					{"type": "text", "text": "Loaded sample.pdf"},
+					{"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBERi0xLjQK"}}
+				]}]}
+			]
+		}`
+		out, err := ConvertClaudeRequestToCodex("gpt-5", []byte(inputJSON), false)
+		if err != nil {
+			t.Fatalf("ConvertClaudeRequestToCodex error: %v", err)
+		}
+		output := ojson.GetBytesNoCopy(out, `input.#(type=="function_call_output").output`)
+		if !output.IsArray() {
+			t.Fatalf("expected array output, got %s", output.Raw)
+		}
+		arr := output.Array()
+		if len(arr) != 2 {
+			t.Fatalf("expected 2 output items, got %d: %s", len(arr), output.Raw)
+		}
+		if arr[0].Get("type").String() != "input_text" || arr[0].Get("text").String() != "Loaded sample.pdf" {
+			t.Fatalf("arr[0] = %s, want input_text", arr[0].Raw)
+		}
+		if arr[1].Get("type").String() != "input_file" || arr[1].Get("filename").String() != "document.pdf" || arr[1].Get("file_data").String() != "data:application/pdf;base64,JVBERi0xLjQK" {
+			t.Fatalf("arr[1] = %s, want input_file with PDF data URL", arr[1].Raw)
+		}
+	})
+
+	t.Run("array pdf document only", func(t *testing.T) {
+		inputJSON := `{
+			"model": "gpt-5",
+			"messages": [
+				{"role": "assistant", "content": [{"type": "tool_use", "id": "call_pdf", "name": "read_file", "input": {}}]},
+				{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_pdf", "content": [
+					{"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "JVBERi0xLjQK"}}
+				]}]}
+			]
+		}`
+		out, err := ConvertClaudeRequestToCodex("gpt-5", []byte(inputJSON), false)
+		if err != nil {
+			t.Fatalf("ConvertClaudeRequestToCodex error: %v", err)
+		}
+		output := ojson.GetBytesNoCopy(out, `input.#(type=="function_call_output").output`)
+		if !output.IsArray() || len(output.Array()) != 1 {
+			t.Fatalf("expected 1-element array output, got %s", output.Raw)
+		}
+		part := output.Array()[0]
+		if part.Get("type").String() != "input_file" || part.Get("filename").String() != "document.pdf" || part.Get("file_data").String() != "data:application/pdf;base64,JVBERi0xLjQK" {
+			t.Fatalf("part = %s, want input_file", part.Raw)
+		}
+	})
+
+	t.Run("singleton object pdf document", func(t *testing.T) {
+		inputJSON := `{
+			"model": "gpt-5",
+			"messages": [
+				{"role": "assistant", "content": [{"type": "tool_use", "id": "call_pdf", "name": "read_file", "input": {}}]},
+				{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_pdf", "content": {
+					"type": "document",
+					"source": {"type": "base64", "media_type": "application/pdf", "data": "JVBERi0xLjQK"}
+				}}]}
+			]
+		}`
+		out, err := ConvertClaudeRequestToCodex("gpt-5", []byte(inputJSON), false)
+		if err != nil {
+			t.Fatalf("ConvertClaudeRequestToCodex error: %v", err)
+		}
+		output := ojson.GetBytesNoCopy(out, `input.#(type=="function_call_output").output`)
+		if !output.IsArray() || len(output.Array()) != 1 {
+			t.Fatalf("expected 1-element array output, got %s", output.Raw)
+		}
+		part := output.Array()[0]
+		if part.Get("type").String() != "input_file" || part.Get("filename").String() != "document.pdf" || part.Get("file_data").String() != "data:application/pdf;base64,JVBERi0xLjQK" {
+			t.Fatalf("part = %s, want input_file", part.Raw)
+		}
+	})
+
+	t.Run("array text and url image", func(t *testing.T) {
+		inputJSON := `{
+			"model": "gpt-5",
+			"messages": [
+				{"role": "assistant", "content": [{"type": "tool_use", "id": "call_img", "name": "fetch_img", "input": {}}]},
+				{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_img", "content": [
+					{"type": "text", "text": "Chart"},
+					{"type": "image", "source": {"type": "url", "url": "https://example.com/chart.png"}}
+				]}]}
+			]
+		}`
+		out, err := ConvertClaudeRequestToCodex("gpt-5", []byte(inputJSON), false)
+		if err != nil {
+			t.Fatalf("ConvertClaudeRequestToCodex error: %v", err)
+		}
+		output := ojson.GetBytesNoCopy(out, `input.#(type=="function_call_output").output`)
+		if !output.IsArray() || len(output.Array()) != 2 {
+			t.Fatalf("expected 2-element array output, got %s", output.Raw)
+		}
+		img := output.Array()[1]
+		if img.Get("type").String() != "input_image" || img.Get("image_url").String() != "https://example.com/chart.png" {
+			t.Fatalf("img = %s, want input_image with URL", img.Raw)
+		}
+	})
+
+	t.Run("singleton object url image", func(t *testing.T) {
+		inputJSON := `{
+			"model": "gpt-5",
+			"messages": [
+				{"role": "assistant", "content": [{"type": "tool_use", "id": "call_img", "name": "fetch_img", "input": {}}]},
+				{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_img", "content": {
+					"type": "image",
+					"source": {"type": "url", "url": "https://example.com/chart.png"}
+				}}]}
+			]
+		}`
+		out, err := ConvertClaudeRequestToCodex("gpt-5", []byte(inputJSON), false)
+		if err != nil {
+			t.Fatalf("ConvertClaudeRequestToCodex error: %v", err)
+		}
+		output := ojson.GetBytesNoCopy(out, `input.#(type=="function_call_output").output`)
+		if !output.IsArray() || len(output.Array()) != 1 {
+			t.Fatalf("expected 1-element array output, got %s", output.Raw)
+		}
+		img := output.Array()[0]
+		if img.Get("type").String() != "input_image" || img.Get("image_url").String() != "https://example.com/chart.png" {
+			t.Fatalf("img = %s, want input_image with URL", img.Raw)
+		}
+	})
+
+	t.Run("singleton object base64 image", func(t *testing.T) {
+		inputJSON := `{
+			"model": "gpt-5",
+			"messages": [
+				{"role": "assistant", "content": [{"type": "tool_use", "id": "call_img", "name": "fetch_img", "input": {}}]},
+				{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_img", "content": {
+					"type": "image",
+					"source": {"type": "base64", "media_type": "image/png", "data": "aGVsbG8="}
+				}}]}
+			]
+		}`
+		out, err := ConvertClaudeRequestToCodex("gpt-5", []byte(inputJSON), false)
+		if err != nil {
+			t.Fatalf("ConvertClaudeRequestToCodex error: %v", err)
+		}
+		output := ojson.GetBytesNoCopy(out, `input.#(type=="function_call_output").output`)
+		if !output.IsArray() || len(output.Array()) != 1 {
+			t.Fatalf("expected 1-element array output, got %s", output.Raw)
+		}
+		img := output.Array()[0]
+		if img.Get("type").String() != "input_image" || img.Get("image_url").String() != "data:image/png;base64,aGVsbG8=" {
+			t.Fatalf("img = %s, want input_image with data URL", img.Raw)
+		}
+	})
+
+	t.Run("array text and non-pdf document emits explicit placeholder instead of silent drop", func(t *testing.T) {
+		inputJSON := `{
+			"model": "gpt-5",
+			"messages": [
+				{"role": "assistant", "content": [{"type": "tool_use", "id": "call_doc", "name": "read_file", "input": {}}]},
+				{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_doc", "content": [
+					{"type": "text", "text": "Header"},
+					{"type": "document", "source": {"type": "base64", "media_type": "text/plain", "data": "aGVsbG8="}}
+				]}]}
+			]
+		}`
+		out, err := ConvertClaudeRequestToCodex("gpt-5", []byte(inputJSON), false)
+		if err != nil {
+			t.Fatalf("ConvertClaudeRequestToCodex error: %v", err)
+		}
+		output := ojson.GetBytesNoCopy(out, `input.#(type=="function_call_output").output`)
+		if !output.IsArray() || len(output.Array()) != 2 {
+			t.Fatalf("expected 2-element array output, got %s", output.Raw)
+		}
+		arr := output.Array()
+		if arr[1].Get("type").String() != "input_text" || arr[1].Get("text").String() != codexUnsupportedDocumentPlaceholder {
+			t.Fatalf("arr[1] = %s, want input_text placeholder %q", arr[1].Raw, codexUnsupportedDocumentPlaceholder)
+		}
+	})
+
+	t.Run("singleton non-pdf document does not dump raw base64 JSON", func(t *testing.T) {
+		inputJSON := `{
+			"model": "gpt-5",
+			"messages": [
+				{"role": "assistant", "content": [{"type": "tool_use", "id": "call_doc", "name": "read_file", "input": {}}]},
+				{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_doc", "content": {
+					"type": "document",
+					"source": {"type": "base64", "media_type": "text/plain", "data": "aGVsbG8="}
+				}}]}
+			]
+		}`
+		out, err := ConvertClaudeRequestToCodex("gpt-5", []byte(inputJSON), false)
+		if err != nil {
+			t.Fatalf("ConvertClaudeRequestToCodex error: %v", err)
+		}
+		output := ojson.GetBytesNoCopy(out, `input.#(type=="function_call_output").output`)
+		if strings.Contains(output.Raw, "aGVsbG8=") {
+			t.Fatalf("raw base64 leaked into output: %s", output.Raw)
+		}
+		if !output.IsArray() || len(output.Array()) != 1 || output.Array()[0].Get("text").String() != codexUnsupportedDocumentPlaceholder {
+			t.Fatalf("output = %s, want 1-element placeholder input_text", output.Raw)
+		}
+	})
+
+	t.Run("array text-source document preserves text", func(t *testing.T) {
+		inputJSON := `{
+			"model": "gpt-5",
+			"messages": [
+				{"role": "assistant", "content": [{"type": "tool_use", "id": "call_doc", "name": "read_file", "input": {}}]},
+				{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_doc", "content": [
+					{"type": "document", "title": "notes.txt", "source": {"type": "text", "media_type": "text/plain", "data": "ORANGE-42"}}
+				]}]}
+			]
+		}`
+		out, err := ConvertClaudeRequestToCodex("gpt-5", []byte(inputJSON), false)
+		if err != nil {
+			t.Fatalf("ConvertClaudeRequestToCodex error: %v", err)
+		}
+		output := ojson.GetBytesNoCopy(out, `input.#(type=="function_call_output").output`)
+		if !output.IsArray() || len(output.Array()) != 1 {
+			t.Fatalf("expected 1-element array output, got %s", output.Raw)
+		}
+		got := output.Array()[0].Get("text").String()
+		if !strings.Contains(got, "ORANGE-42") || !strings.Contains(got, "notes.txt") {
+			t.Fatalf("text-source document lost content: %s", output.Raw)
+		}
+	})
+
+	t.Run("singleton text-source document preserves text", func(t *testing.T) {
+		inputJSON := `{
+			"model": "gpt-5",
+			"messages": [
+				{"role": "assistant", "content": [{"type": "tool_use", "id": "call_doc", "name": "read_file", "input": {}}]},
+				{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call_doc", "content": {
+					"type": "document",
+					"source": {"type": "text", "media_type": "text/plain", "data": "ORANGE-42"}
+				}}]}
+			]
+		}`
+		out, err := ConvertClaudeRequestToCodex("gpt-5", []byte(inputJSON), false)
+		if err != nil {
+			t.Fatalf("ConvertClaudeRequestToCodex error: %v", err)
+		}
+		output := ojson.GetBytesNoCopy(out, `input.#(type=="function_call_output").output`)
+		if !output.IsArray() || len(output.Array()) != 1 || output.Array()[0].Get("text").String() != "ORANGE-42" {
+			t.Fatalf("singleton text-source document lost content: %s", output.Raw)
+		}
+	})
 }

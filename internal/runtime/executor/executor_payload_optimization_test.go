@@ -22,6 +22,34 @@ func TestEnsureColonSpacedJSONLeavesInvalidPayloadUnchanged(t *testing.T) {
 	}
 }
 
+func TestNormalizeKimiToolMessageLinksReusesCanonicalPayload(t *testing.T) {
+	input := []byte(`{"messages":[{"role":"assistant","reasoning_content":"checking","tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}]},{"role":"tool","tool_call_id":"call_1","content":"ok"}]}`)
+	output, errNormalize := normalizeKimiToolMessageLinks(input)
+	if errNormalize != nil {
+		t.Fatalf("normalizeKimiToolMessageLinks returned error: %v", errNormalize)
+	}
+	if &output[0] != &input[0] {
+		t.Fatal("canonical Kimi tool history was copied")
+	}
+}
+
+func TestNormalizeKimiToolMessageLinksPreservesLargeArguments(t *testing.T) {
+	input := []byte(`{"messages":[{"role":"assistant","content":"lookup","tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":{"id":9007199254740993}}}]},{"role":"tool","call_id":"call_1","content":"ok"}]}`)
+	output, errNormalize := normalizeKimiToolMessageLinks(input)
+	if errNormalize != nil {
+		t.Fatalf("normalizeKimiToolMessageLinks returned error: %v", errNormalize)
+	}
+	if got := ojson.GetBytes(output, "messages.0.tool_calls.0.function.arguments.id").Raw; got != "9007199254740993" {
+		t.Fatalf("argument id = %s, want exact large integer", got)
+	}
+	if got := ojson.GetBytes(output, "messages.1.tool_call_id").String(); got != "call_1" {
+		t.Fatalf("tool_call_id = %q, want call_1", got)
+	}
+	if got := ojson.GetBytes(output, "messages.0.reasoning_content").String(); got != "lookup" {
+		t.Fatalf("reasoning_content = %q, want lookup", got)
+	}
+}
+
 func TestCodexMultipartImageEditAppendsExistingImages(t *testing.T) {
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
@@ -109,6 +137,67 @@ func BenchmarkCodexBuildImagesAPIResponseLargePayload(b *testing.B) {
 	}
 }
 
+func BenchmarkNormalizeKimiToolMessageLinksLargeSinglePatch(b *testing.B) {
+	content := strings.Repeat("x", 8<<20)
+	input := []byte(`{"messages":[{"role":"assistant","content":"` + content + `","tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}]},{"role":"tool","tool_call_id":"call_1","content":"ok"}]}`)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(input)))
+	b.ResetTimer()
+	for b.Loop() {
+		benchmarkExecutorPayloadOutput, _ = normalizeKimiToolMessageLinks(input)
+	}
+}
+
+func BenchmarkNormalizeKimiToolMessageLinksLargeMultiplePatches(b *testing.B) {
+	content := strings.Repeat("x", (8<<20)/32)
+	var builder strings.Builder
+	builder.Grow(8 << 20)
+	builder.WriteString(`{"messages":[`)
+	for index := 0; index < 32; index++ {
+		if index > 0 {
+			builder.WriteByte(',')
+		}
+		builder.WriteString(`{"role":"assistant","content":"`)
+		builder.WriteString(content)
+		builder.WriteString(`","tool_calls":[{"id":"call_`)
+		builder.WriteString(strings.Repeat("x", index%3))
+		builder.WriteString(`","type":"function","function":{"name":"lookup","arguments":"{}"}}]},{"role":"tool","call_id":"call_`)
+		builder.WriteString(strings.Repeat("x", index%3))
+		builder.WriteString(`","content":"ok"}`)
+	}
+	builder.WriteString(`]}`)
+	input := []byte(builder.String())
+	b.ReportAllocs()
+	b.SetBytes(int64(len(input)))
+	b.ResetTimer()
+	for b.Loop() {
+		benchmarkExecutorPayloadOutput, _ = normalizeKimiToolMessageLinks(input)
+	}
+}
+
+func BenchmarkNormalizeKimiToolMessageLinksLargeCanonicalPayload(b *testing.B) {
+	content := strings.Repeat("x", (8<<20)/64)
+	var builder strings.Builder
+	builder.Grow(8 << 20)
+	builder.WriteString(`{"messages":[`)
+	for index := 0; index < 64; index++ {
+		if index > 0 {
+			builder.WriteByte(',')
+		}
+		builder.WriteString(`{"role":"user","content":"`)
+		builder.WriteString(content)
+		builder.WriteString(`"}`)
+	}
+	builder.WriteString(`]}`)
+	input := []byte(builder.String())
+	b.ReportAllocs()
+	b.SetBytes(int64(len(input)))
+	b.ResetTimer()
+	for b.Loop() {
+		benchmarkExecutorPayloadOutput, _ = normalizeKimiToolMessageLinks(input)
+	}
+}
+
 func TestObserveClaudeStreamJSONPayloadClonesMessageID(t *testing.T) {
 	buf := []byte(`{"type":"message_start","message":{"id":"msg_reusable_buffer_01"}}`)
 	var msgID string
@@ -185,6 +274,56 @@ func TestExecutorPayloadSingleDocPipelinesByteConsistency(t *testing.T) {
 		}
 	})
 
+	t.Run("xai doc pipeline matches byte pipeline", func(t *testing.T) {
+		raw := []byte(`{"model":"grok-4","tool_choice":"auto","tools":[{"type":"custom","name":"my_tool"}],"input":[{"type":"additional_tools","tools":[{"type":"function","name":"extra_fn","parameters":{"type":"object","properties":{}}}]},{"type":"custom_tool_call","call_id":"call_1","name":"my_tool","input":"{\"a\":1}"},{"type":"reasoning","content":null,"encrypted_content":"invalid"}],"image":{"image_url":"https://example.com/a.png"}}`)
+
+		byteOut := bytes.Clone(raw)
+		byteOut = normalizeXAIToolsWithFold(byteOut, false)
+		byteOut = promoteXAIAdditionalTools(byteOut)
+		byteOut = normalizeXAIToolChoiceForTools(byteOut)
+		byteOut = normalizeXAIInputCustomToolCalls(byteOut)
+		byteOut = normalizeXAIInputReasoningItems(byteOut)
+		byteOut = sanitizeXAIInputEncryptedContentForBaseURL(byteOut, "")
+		byteOut = normalizeXAIImageRefs(byteOut)
+
+		doc := ojson.NewDoc(bytes.Clone(raw))
+		normalizeXAIToolsWithFoldDoc(doc, false)
+		promoteXAIAdditionalToolsDoc(doc)
+		normalizeXAIToolChoiceForToolsDoc(doc)
+		normalizeXAIInputCustomToolCallsDoc(doc)
+		normalizeXAIInputReasoningItemsDoc(doc)
+		sanitizeXAIInputEncryptedContentForBaseURLDoc(doc, "")
+		normalizeXAIImageRefsDoc(doc)
+		docOut := doc.Bytes()
+
+		if !bytes.Equal(docOut, byteOut) {
+			t.Fatalf("xai doc output mismatch:\ndoc:  %s\nbyte: %s", docOut, byteOut)
+		}
+	})
+
+	t.Run("kimi doc pipeline matches byte pipeline", func(t *testing.T) {
+		raw := []byte(`{"model":"kimi-k2.5","temperature":0.2,"thinking":{"type":"enabled"},"tools":[{"type":"function","function":{"name":"lookup","parameters":{"$defs":{" item":{"type":"string"}},"properties":{"x":{"$ref":"#/$defs/ item"}}}}}],"messages":[{"role":"assistant","content":"thinking","tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}]},{"role":"tool","call_id":"call_1","content":"ok"}]}`)
+
+		byteOut, errByte := normalizeKimiToolMessageLinks(bytes.Clone(raw))
+		if errByte != nil {
+			t.Fatalf("normalizeKimiToolMessageLinks: %v", errByte)
+		}
+		byteOut = normalizeKimiTools(byteOut)
+		byteOut = normalizeKimiTemperature(byteOut)
+
+		doc := ojson.NewDoc(bytes.Clone(raw))
+		if errDoc := normalizeKimiToolMessageLinksDoc(doc); errDoc != nil {
+			t.Fatalf("normalizeKimiToolMessageLinksDoc: %v", errDoc)
+		}
+		normalizeKimiToolsDoc(doc)
+		normalizeKimiTemperatureDoc(doc)
+		docOut := doc.Bytes()
+
+		if !bytes.Equal(docOut, byteOut) {
+			t.Fatalf("kimi doc output mismatch:\ndoc:  %s\nbyte: %s", docOut, byteOut)
+		}
+	})
+
 	t.Run("gemini and aistudio doc pipeline matches byte pipeline", func(t *testing.T) {
 		raw := []byte(`{"generationConfig":{"thinkingConfig":{"thinkingLevel":"medium"},"responseModalities":["TEXT","IMAGE"],"imageConfig":{"aspectRatio":"1:1"}},"contents":[{"role":"user","parts":[{"text":"draw"}]}]}`)
 
@@ -233,6 +372,114 @@ func TestAntigravityReasoningReplayAccumulatorClonesStreamSignatures(t *testing.
 	}
 	if got := ojson.GetBytesNoCopy(acc.items[0], "thoughtSignature").String(); got != "sig_detached_reusable_01" {
 		t.Fatalf("replayed item thoughtSignature = %q, want sig_detached_reusable_01", got)
+	}
+}
+
+func TestXAIResponseFilterAndNamespaceRestorerCloneStreamItemIDs(t *testing.T) {
+	filter := newXAIInternalXSearchResponseFilter(true, nil)
+	addedBuf := []byte(`{"type":"response.output_item.added","output_index":0,"item":{"id":"ctc_reusable_01","call_id":"xs_call_reusable_01","type":"custom_tool_call","name":"x_keyword_search"}}`)
+	if got := filter.apply(addedBuf); got != nil {
+		t.Fatalf("expected initial internal x_search item to be dropped, got %s", got)
+	}
+	for i := range addedBuf {
+		addedBuf[i] = 'X'
+	}
+
+	deltaByItemID := []byte(`{"type":"response.custom_tool_call_input.delta","item_id":"ctc_reusable_01","delta":"{}"}`)
+	if got := filter.apply(deltaByItemID); got != nil {
+		t.Fatalf("expected delta referencing ctc_reusable_01 to be dropped after buffer overwrite, got %s", got)
+	}
+	doneByCallID := []byte(`{"type":"response.custom_tool_call_input.done","call_id":"xs_call_reusable_01"}`)
+	if got := filter.apply(doneByCallID); got != nil {
+		t.Fatalf("expected done referencing xs_call_reusable_01 to be dropped after buffer overwrite, got %s", got)
+	}
+
+	restorer := newXAINamespaceRestorer(map[string]xaiNamespaceToolRef{
+		"mcp__codex_app": {
+			namespace:    "mcp__codex_app",
+			isDispatcher: true,
+			children:     map[string]struct{}{"lookup": {}},
+		},
+	})
+	dispAddedBuf := []byte(`{"type":"response.output_item.added","item":{"id":"fc_disp_reusable_01","type":"function_call","name":"mcp__codex_app"}}`)
+	_ = restorer.restore(dispAddedBuf)
+	for i := range dispAddedBuf {
+		dispAddedBuf[i] = 'X'
+	}
+	argsDone := []byte(`{"type":"response.function_call_arguments.done","item_id":"fc_disp_reusable_01","arguments":"{\"name\":\"lookup\",\"arguments\":{\"k\":\"v\"}}"}`)
+	restored := restorer.restore(argsDone)
+	if got := ojson.GetBytesNoCopy(restored, "arguments").String(); got != `{"k":"v"}` {
+		t.Fatalf("restored arguments = %q, want {\"k\":\"v\"}", got)
+	}
+}
+
+func TestNormalizeXAIImageRefsDocArbitraryNestedExtensionPath(t *testing.T) {
+	raw := []byte(`{"model":"grok-4","extension":{"image":{"image_url":"https://example.com/ext.png"}},"deep":{"arr":[{"reference_images":[{"image_url":{"url":"https://example.com/ref.png"}}]}]}}`)
+	doc := ojson.NewDoc(bytes.Clone(raw))
+	_ = doc.Set("model", "grok-3")
+	_ = doc.Set("stream", true)
+	if !normalizeXAIImageRefsDoc(doc) {
+		t.Fatal("expected normalizeXAIImageRefsDoc to report true")
+	}
+	out := doc.Bytes()
+	if got := ojson.GetBytesNoCopy(out, "extension.image.url").String(); got != "https://example.com/ext.png" {
+		t.Fatalf("extension.image.url = %q, want https://example.com/ext.png", got)
+	}
+	if ojson.GetBytesNoCopy(out, "extension.image.image_url").Exists() {
+		t.Fatalf("extension.image.image_url should be removed: %s", out)
+	}
+	if got := ojson.GetBytesNoCopy(out, "deep.arr.0.reference_images.0.url").String(); got != "https://example.com/ref.png" {
+		t.Fatalf("deep.arr.0.reference_images.0.url = %q, want https://example.com/ref.png", got)
+	}
+	if ojson.GetBytesNoCopy(out, "deep.arr.0.reference_images.0.image_url").Exists() {
+		t.Fatalf("deep.arr.0.reference_images.0.image_url should be removed: %s", out)
+	}
+
+	nestedInsideDeleted := ojson.NewDoc([]byte(`{"image":{"image_url":{"url":"outer","image":{"image_url":"inner"}}}}`))
+	if !normalizeXAIImageRefsDoc(nestedInsideDeleted) {
+		t.Fatal("expected nestedInsideDeleted to be normalized")
+	}
+	if got := string(nestedInsideDeleted.Bytes()); got != `{"image":{"url":"outer"}}` {
+		t.Fatalf("nestedInsideDeleted = %s, want {\"image\":{\"url\":\"outer\"}}", got)
+	}
+
+	unicodeEscapedKey := ojson.NewDoc([]byte(`{"image":{"url":"keep"},"extension":{"im\u0061ge":{"image_url":"ext"}}}`))
+	if !normalizeXAIImageRefsDoc(unicodeEscapedKey) {
+		t.Fatal("expected unicodeEscapedKey to be normalized")
+	}
+	unicodeOut := unicodeEscapedKey.Bytes()
+	if got := ojson.GetBytesNoCopy(unicodeOut, "extension.image.url").String(); got != "ext" {
+		t.Fatalf("extension.image.url = %q, want ext; body=%s", got, unicodeOut)
+	}
+	if ojson.GetBytesNoCopy(unicodeOut, "extension.image.image_url").Exists() {
+		t.Fatalf("extension.image.image_url should be removed: %s", unicodeOut)
+	}
+
+	newlyAddedTopKey := ojson.NewDoc([]byte(`{"model":"grok-4"}`))
+	_ = newlyAddedTopKey.Set("extension.image.image_url", "new")
+	if !normalizeXAIImageRefsDoc(newlyAddedTopKey) {
+		t.Fatal("expected newlyAddedTopKey to be normalized")
+	}
+	if got := string(newlyAddedTopKey.Bytes()); got != `{"model":"grok-4","extension":{"image":{"url":"new"}}}` {
+		t.Fatalf("newlyAddedTopKey = %s, want {\"model\":\"grok-4\",\"extension\":{\"image\":{\"url\":\"new\"}}}", got)
+	}
+
+	mutatedEmptyKey := ojson.NewDoc([]byte(`{"":{"image":{"image_url":"old"}}}`))
+	_ = mutatedEmptyKey.Set(".image.image_url", "new")
+	if !normalizeXAIImageRefsDoc(mutatedEmptyKey) {
+		t.Fatal("expected mutatedEmptyKey to be normalized")
+	}
+	if got := string(mutatedEmptyKey.Bytes()); got != `{"":{"image":{"url":"new"}}}` {
+		t.Fatalf("mutatedEmptyKey = %s, want {\"\":{\"image\":{\"url\":\"new\"}}}", got)
+	}
+
+	deletedEmptyKey := ojson.NewDoc([]byte(`{"":{"image":{"image_url":"old"}},"other":1}`))
+	_ = deletedEmptyKey.Delete(".image")
+	if normalizeXAIImageRefsDoc(deletedEmptyKey) {
+		t.Fatal("expected deletedEmptyKey to report false after .image was deleted")
+	}
+	if got := string(deletedEmptyKey.Bytes()); got != `{"":{},"other":1}` {
+		t.Fatalf("deletedEmptyKey = %s, want {\"\":{},\"other\":1}", got)
 	}
 }
 
@@ -426,4 +673,33 @@ func TestClaudeStreamDocScannerEdgeCases(t *testing.T) {
 			t.Fatalf("expected first user message to receive cache_control: %s", got)
 		}
 	})
+}
+
+func TestNormalizeXAIImageRefsDocAvoidsLargePayloadCopy(t *testing.T) {
+	largePrompt := strings.Repeat("x", 1<<20)
+	raw := []byte(`{"model":"grok-imagine-image","prompt":"` + largePrompt + `","image":{"image_url":"https://example.com/a.png"}}`)
+	doc := ojson.NewDoc(raw)
+
+	// Warm up ojson WriteTo buffer pool before measuring allocations.
+	warmDoc := ojson.NewDoc([]byte(`{"model":"grok-imagine-image","image":{"image_url":"https://example.com/w.png"}}`))
+	normalizeXAIImageRefsDoc(warmDoc)
+
+	var mBefore, mAfter runtime.MemStats
+	runtime.ReadMemStats(&mBefore)
+	if !normalizeXAIImageRefsDoc(doc) {
+		t.Fatal("expected normalizeXAIImageRefsDoc to report true")
+	}
+	runtime.ReadMemStats(&mAfter)
+
+	allocated := mAfter.TotalAlloc - mBefore.TotalAlloc
+	if allocated > 32*1024 {
+		t.Fatalf("normalizeXAIImageRefsDoc allocated %d bytes for 1MiB payload, want < 32 KiB", allocated)
+	}
+	out := doc.Bytes()
+	if got := ojson.GetBytesNoCopy(out, "image.url").String(); got != "https://example.com/a.png" {
+		t.Fatalf("image.url = %q, want https://example.com/a.png", got)
+	}
+	if ojson.GetBytesNoCopy(out, "image.image_url").Exists() {
+		t.Fatalf("image.image_url should be deleted")
+	}
 }

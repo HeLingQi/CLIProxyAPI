@@ -122,29 +122,83 @@ func TestConvertInteractionsRequestToCodexGenerationConfigAliasPriority(t *testi
 }
 
 func TestConvertInteractionsRequestToCodexWithToolMessagesDirect(t *testing.T) {
-	out, _ := ConvertInteractionsRequestToCodex("codex-test", []byte(`{"model":"codex-test","system_instruction":"be brief","input":[{"type":"user_input","content":[{"type":"text","text":"hi"}]},{"type":"thought","content":[{"type":"text","text":"thinking"}]},{"type":"function_call","name":"lookup","call_id":"call_1","arguments":{"q":"x"}},{"type":"function_result","name":"lookup","call_id":"call_1","result":{"ok":true}}],"tools":[{"type":"function","name":"lookup","parameters":{"type":"object","properties":{"q":{"type":"string"}}}}]}`), false)
-	if got := ojson.GetBytesNoCopy(out, "instructions").String(); got != "be brief" {
-		t.Fatalf("instructions = %q, want be brief. Output: %s", got, string(out))
-	}
-	if got := ojson.GetBytesNoCopy(out, "input.0.content.0.text").String(); got != "hi" {
-		t.Fatalf("input.0.content.0.text = %q, want hi. Output: %s", got, string(out))
+	out, errConvert := ConvertInteractionsRequestToCodex("codex-test", []byte(`{"model":"codex-test","system_instruction":"be brief","input":[{"type":"user_input","content":[{"type":"text","text":"hi"}]},{"type":"thought","content":[{"type":"text","text":"thinking"}]},{"type":"function_call","name":"lookup","call_id":"call_1","arguments":{"q":"x"}},{"type":"function_result","name":"lookup","call_id":"call_1","result":{"ok":true}}],"tools":[{"type":"function","name":"lookup","parameters":{"type":"object","properties":{"q":{"type":"string"}}}}]}`), false)
+	if errConvert != nil {
+		t.Fatalf("ConvertInteractionsRequestToCodex() error = %v", errConvert)
 	}
 	// The signatureless thought step is dropped entirely: a reasoning item
 	// without replayable encrypted_content is rejected by both upstreams.
-	if got := ojson.GetBytesNoCopy(out, "input.1.type").String(); got != "function_call" {
-		t.Fatalf("input.1.type = %q, want function_call. Output: %s", got, string(out))
+	root := util.ParseGJSONBytesNoCopy(out)
+	for path, want := range map[string]string{
+		"instructions":           "",
+		"input.#":                "4",
+		"input.0.type":           "message",
+		"input.0.role":           "developer",
+		"input.0.content.#":      "1",
+		"input.0.content.0.type": "input_text",
+		"input.0.content.0.text": "be brief",
+		"input.1.role":           "user",
+		"input.1.content.0.text": "hi",
+		"input.2.type":           "function_call",
+		"input.2.call_id":        "call_1",
+		"input.3.type":           "function_call_output",
+		"input.3.call_id":        "call_1",
+		"tools.0.name":           "lookup",
+	} {
+		if got := root.Get(path).String(); got != want {
+			t.Errorf("%s = %q, want %q; output=%s", path, got, want, out)
+		}
 	}
-	if got := ojson.GetBytesNoCopy(out, "input.1.call_id").String(); got != "call_1" {
-		t.Fatalf("function_call call_id = %q, want call_1. Output: %s", got, string(out))
+	for _, path := range []string{"contents", "system_instruction", "systemInstruction"} {
+		if root.Get(path).Exists() {
+			t.Errorf("%s should not be forwarded; output=%s", path, out)
+		}
 	}
-	if got := ojson.GetBytesNoCopy(out, "input.2.type").String(); got != "function_call_output" {
-		t.Fatalf("input.2.type = %q, want function_call_output. Output: %s", got, string(out))
-	}
-	if got := ojson.GetBytesNoCopy(out, "tools.0.name").String(); got != "lookup" {
-		t.Fatalf("tools.0.name = %q, want lookup. Output: %s", got, string(out))
-	}
-	if ojson.GetBytesNoCopy(out, "contents").Exists() || ojson.GetBytesNoCopy(out, "systemInstruction").Exists() {
-		t.Fatalf("Codex request must not use foreign request shape. Output: %s", string(out))
+}
+
+func TestConvertInteractionsRequestToCodexSystemInstructionForms(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		fields string
+		want   string
+	}{
+		{"snake case takes precedence", `,"system_instruction":"  first\n","systemInstruction":"ignored"`, "  first\n"},
+		{"camel case alias", `,"systemInstruction":"alias"`, "alias"},
+		{"object text takes precedence", `,"system_instruction":{"text":"  object text  ","parts":[{"text":"ignored"}]}`, "  object text  "},
+		{"parts joined with newlines", `,"systemInstruction":{"parts":[{"text":" first "},{"text":""},{"type":"image"},{"text":"\tsecond\n"}]}`, " first \n\tsecond\n"},
+		{"whitespace is preserved", `,"system_instruction":" \t "`, " \t "},
+		{"absent", "", ""},
+		{"empty string suppresses alias", `,"system_instruction":"","systemInstruction":"ignored"`, ""},
+		{"null suppresses alias", `,"system_instruction":null,"systemInstruction":"ignored"`, ""},
+		{"empty object text suppresses parts", `,"system_instruction":{"text":"","parts":[{"text":"ignored"}]}`, ""},
+		{"empty parts", `,"system_instruction":{"parts":[{}, {"text":""}]}`, ""},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			out, errConvert := ConvertInteractionsRequestToCodex("codex-test", []byte(`{"input":"hi"`+tt.fields+`}`), false)
+			if errConvert != nil {
+				t.Fatalf("ConvertInteractionsRequestToCodex() error = %v", errConvert)
+			}
+			root := util.ParseGJSONBytesNoCopy(out)
+			if got := root.Get("instructions").Raw; got != `""` {
+				t.Errorf("instructions = %s, want empty string; output=%s", got, out)
+			}
+			items := root.Get("input").Array()
+			wantLen := 1
+			if tt.want != "" {
+				wantLen++
+			}
+			if len(items) != wantLen {
+				t.Fatalf("input has %d items, want %d; output=%s", len(items), wantLen, out)
+			}
+			if tt.want != "" {
+				if got := items[0].Get("content.0.text").String(); got != tt.want || items[0].Get("role").String() != "developer" {
+					t.Errorf("input[0] = %s, want developer message with text %q", items[0].Raw, tt.want)
+				}
+			}
+			if user := items[wantLen-1]; user.Get("role").String() != "user" || user.Get("content.0.text").String() != "hi" {
+				t.Errorf("last input item = %s, want user message with text hi", user.Raw)
+			}
+		})
 	}
 }
 
@@ -414,6 +468,38 @@ func TestConvertCodexResponseToInteractionsStream_ReasoningSignature(t *testing.
 	}
 }
 
+func TestConvertInteractionsRequestToCodex_RestoresThoughtSignature(t *testing.T) {
+	metaSig := testInteractionsMetaSignature()
+	routedSig := metaSig + "." + strings.Repeat("Ab3", 23)[:67]
+	for _, tc := range []struct {
+		name  string
+		model string
+		sig   string
+	}{
+		{"native meta", "muse-spark-1.3", metaSig},
+		{"namespaced router model", "meta/muse-wonder", metaSig},
+		{"routed meta verbatim", "meta/muse-wonder", routedSig},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			payload := []byte(`{"model":"` + tc.model + `","input":[{"type":"thought","signature":"` + tc.sig + `","content":[{"type":"text","text":"thinking"}]}]}`)
+			out, _ := ConvertInteractionsRequestToCodex(tc.model, payload, false)
+			item := ojson.GetBytesNoCopy(out, "input.0")
+			if got := item.Get("type").String(); got != "reasoning" {
+				t.Fatalf("input.0.type = %q, want reasoning. Output: %s", got, string(out))
+			}
+			if got := item.Get("encrypted_content").String(); got != tc.sig {
+				t.Fatalf("encrypted_content = %q, want signature verbatim. Output: %s", got, string(out))
+			}
+			if got := item.Get("summary.0.text").String(); got != "thinking" {
+				t.Fatalf("summary.0.text = %q, want thinking. Output: %s", got, string(out))
+			}
+			if item.Get("content").Exists() {
+				t.Fatalf("replay item must not carry content. Output: %s", string(out))
+			}
+		})
+	}
+}
+
 func TestConvertInteractionsRequestToCodex_ThoughtSignatureTargetMismatch(t *testing.T) {
 	metaSig := testInteractionsMetaSignature()
 	payload := []byte(`{"model":"gpt-5.4","input":[{"type":"thought","signature":"` + metaSig + `","content":[{"type":"text","text":"thinking"}],"id":"step_1"}]}`)
@@ -423,6 +509,64 @@ func TestConvertInteractionsRequestToCodex_ThoughtSignatureTargetMismatch(t *tes
 	out, _ := ConvertInteractionsRequestToCodex("gpt-5.4", payload, false)
 	if got := len(ojson.GetBytesNoCopy(out, "input").Array()); got != 0 {
 		t.Fatalf("input len = %d, want 0 (mismatched thought dropped). Output: %s", got, string(out))
+	}
+}
+
+func TestConvertInteractionsRequestToCodex_DropsEmptyThoughtSteps(t *testing.T) {
+	metaSig := testInteractionsMetaSignature()
+
+	// A rejected signature with no text emits no item at all: a bare
+	// reasoning item carries nothing replayable and is rejected upstream.
+	out, _ := ConvertInteractionsRequestToCodex("gpt-5.4", []byte(`{"input":[{"type":"user_input","content":[{"type":"text","text":"hi"}]},{"type":"thought","signature":"`+metaSig+`"}]}`), false)
+	if got := len(ojson.GetBytesNoCopy(out, "input").Array()); got != 1 {
+		t.Fatalf("input len = %d, want 1 (thought step dropped). Output: %s", got, string(out))
+	}
+
+	// A signatureless, textless thought step emits no item.
+	out, _ = ConvertInteractionsRequestToCodex("muse-spark-1.3", []byte(`{"input":[{"type":"thought"}]}`), false)
+	if got := len(ojson.GetBytesNoCopy(out, "input").Array()); got != 0 {
+		t.Fatalf("input len = %d, want 0. Output: %s", got, string(out))
+	}
+
+	// A duplicate accepted signature with no text emits nothing the second
+	// time either.
+	out, _ = ConvertInteractionsRequestToCodex("muse-spark-1.3", []byte(`{"input":[{"type":"thought","signature":"`+metaSig+`"},{"type":"thought","signature":"`+metaSig+`"}]}`), false)
+	if got := len(ojson.GetBytesNoCopy(out, "input").Array()); got != 1 {
+		t.Fatalf("input len = %d, want 1 (duplicate without text dropped). Output: %s", got, string(out))
+	}
+
+	// A signatureless thought with text is dropped too, and the message/tool
+	// items around it keep their order.
+	out, _ = ConvertInteractionsRequestToCodex("muse-spark-1.3", []byte(`{"input":[{"type":"user_input","content":[{"type":"text","text":"hi"}]},{"type":"thought","content":[{"type":"text","text":"thinking"}]},{"type":"function_call","name":"lookup","call_id":"call_1","arguments":{"q":"x"}}]}`), false)
+	items := ojson.GetBytesNoCopy(out, "input").Array()
+	if len(items) != 2 || items[0].Get("type").String() != "message" || items[1].Get("type").String() != "function_call" {
+		t.Fatalf("input = %s, want [message, function_call] with the thought dropped", items)
+	}
+}
+
+func TestConvertInteractionsRequestToCodex_ThoughtSignatureVariants(t *testing.T) {
+	metaSig := testInteractionsMetaSignature()
+	gptSig := testInteractionsGPTSignature()
+
+	// A cache-prefixed signature normalizes to its native payload.
+	out, _ := ConvertInteractionsRequestToCodex("gpt-5.4", []byte(`{"input":[{"type":"thought","signature":"gpt#`+gptSig+`"}]}`), false)
+	if got := ojson.GetBytesNoCopy(out, "input.0.encrypted_content").String(); got != gptSig {
+		t.Fatalf("prefixed GPT signature should normalize to native payload. Output: %s", string(out))
+	}
+
+	// The snake_case thought_signature spelling is accepted too.
+	out, _ = ConvertInteractionsRequestToCodex("muse-spark-1.3", []byte(`{"input":[{"type":"thought","thought_signature":"`+metaSig+`"}]}`), false)
+	if got := ojson.GetBytesNoCopy(out, "input.0.encrypted_content").String(); got != metaSig {
+		t.Fatalf("thought_signature field should be accepted. Output: %s", string(out))
+	}
+
+	// An identical signature replays once; the duplicate thought is dropped.
+	out, _ = ConvertInteractionsRequestToCodex("muse-spark-1.3", []byte(`{"input":[{"type":"thought","signature":"`+metaSig+`","content":[{"type":"text","text":"one"}]},{"type":"thought","signature":"`+metaSig+`","content":[{"type":"text","text":"two"}]}]}`), false)
+	if got := len(ojson.GetBytesNoCopy(out, "input").Array()); got != 1 {
+		t.Fatalf("input len = %d, want 1 (duplicate dropped). Output: %s", got, string(out))
+	}
+	if got := ojson.GetBytesNoCopy(out, "input.0.encrypted_content").String(); got != metaSig {
+		t.Fatalf("first thought should carry the signature. Output: %s", string(out))
 	}
 }
 
@@ -498,4 +642,86 @@ func codexInteractionsFrameEventName(event []byte) string {
 		}
 	}
 	return ""
+}
+
+func TestConvertCodexResponseToInteractions_RefusalStreamAndNonStream(t *testing.T) {
+	const refusalText = "I'm sorry, but I can't help with that request."
+	ctx := context.Background()
+
+	t.Run("streamed_refusal_delta_no_duplicate", func(t *testing.T) {
+		var param any
+		events := [][]byte{
+			[]byte(`data: {"type":"response.created","response":{"id":"resp_1","model":"muse-ember-1.0"}}`),
+			[]byte(`data: {"type":"response.output_item.added","output_index":0,"item":{"id":"msg_1","type":"message","role":"assistant","content":[]}}`),
+			[]byte(`data: {"type":"response.refusal.delta","output_index":0,"item_id":"msg_1","delta":"I'm sorry, but I can't help with that request."}`),
+			[]byte(`data: {"type":"response.output_item.done","output_index":0,"item":{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"refusal","refusal":"I'm sorry, but I can't help with that request."}]}}`),
+			[]byte(`data: {"type":"response.completed","response":{"id":"resp_1","status":"completed"}}`),
+		}
+		var combined strings.Builder
+		for _, ev := range events {
+			for _, out := range ConvertCodexResponseToInteractions(ctx, "muse-ember-1.0", nil, nil, ev, &param) {
+				combined.Write(out)
+			}
+		}
+		got := combined.String()
+		if count := strings.Count(got, refusalText); count != 1 {
+			t.Fatalf("stream refusal count = %d, want 1:\n%s", count, got)
+		}
+	})
+
+	t.Run("done_only_refusal_fallback", func(t *testing.T) {
+		var param any
+		events := [][]byte{
+			[]byte(`data: {"type":"response.created","response":{"id":"resp_1","model":"muse-ember-1.0"}}`),
+			[]byte(`data: {"type":"response.output_item.done","output_index":0,"item":{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"refusal","refusal":"I'm sorry, but I can't help with that request."}]}}`),
+			[]byte(`data: {"type":"response.completed","response":{"id":"resp_1","status":"completed"}}`),
+		}
+		var combined strings.Builder
+		for _, ev := range events {
+			for _, out := range ConvertCodexResponseToInteractions(ctx, "muse-ember-1.0", nil, nil, ev, &param) {
+				combined.Write(out)
+			}
+		}
+		got := combined.String()
+		if count := strings.Count(got, refusalText); count != 1 {
+			t.Fatalf("done-only stream refusal count = %d, want 1:\n%s", count, got)
+		}
+	})
+
+	t.Run("nonstream_refusal", func(t *testing.T) {
+		raw := []byte(`{"type":"response.completed","response":{"id":"resp_1","model":"muse-ember-1.0","status":"completed","output":[{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"refusal","refusal":"I'm sorry, but I can't help with that request."}]}]}}`)
+		out := ConvertCodexResponseToInteractionsNonStream(ctx, "muse-ember-1.0", nil, nil, raw, nil)
+		if got := ojson.GetBytesNoCopy(out, "steps.0.content.0.text").String(); got != refusalText {
+			t.Fatalf("nonstream text = %q, want %q; body=%s", got, refusalText, out)
+		}
+	})
+
+	t.Run("empty_refusal_delta_does_not_suppress_done_fallback", func(t *testing.T) {
+		var param any
+		events := [][]byte{
+			[]byte(`data: {"type":"response.created","response":{"id":"resp_1","model":"muse-ember-1.0"}}`),
+			[]byte(`data: {"type":"response.output_item.added","output_index":0,"item":{"id":"msg_1","type":"message","role":"assistant","content":[]}}`),
+			[]byte(`data: {"type":"response.refusal.delta","output_index":0,"item_id":"msg_1","delta":""}`),
+			[]byte(`data: {"type":"response.output_item.done","output_index":0,"item":{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"refusal","refusal":"I'm sorry, but I can't help with that request."}]}}`),
+			[]byte(`data: {"type":"response.completed","response":{"id":"resp_1","status":"completed"}}`),
+		}
+		var combined strings.Builder
+		for _, ev := range events {
+			for _, out := range ConvertCodexResponseToInteractions(ctx, "muse-ember-1.0", nil, nil, ev, &param) {
+				combined.Write(out)
+			}
+		}
+		got := combined.String()
+		if count := strings.Count(got, refusalText); count != 1 {
+			t.Fatalf("empty-delta fallback refusal count = %d, want 1:\n%s", count, got)
+		}
+	})
+
+	t.Run("empty_refusal_field_falls_back_to_text", func(t *testing.T) {
+		raw := []byte(`{"type":"response.completed","response":{"id":"resp_1","model":"muse-ember-1.0","status":"completed","output":[{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"refusal","refusal":"","text":"I'm sorry, but I can't help with that request."}]}]}}`)
+		out := ConvertCodexResponseToInteractionsNonStream(ctx, "muse-ember-1.0", nil, nil, raw, nil)
+		if got := ojson.GetBytesNoCopy(out, "steps.0.content.0.text").String(); got != refusalText {
+			t.Fatalf("nonstream fallback text = %q, want %q; body=%s", got, refusalText, out)
+		}
+	})
 }

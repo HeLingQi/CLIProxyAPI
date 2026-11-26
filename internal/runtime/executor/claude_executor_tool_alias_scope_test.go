@@ -16,6 +16,7 @@ func TestClaudeOAuthToolAliasStoreIsSharedAcrossForAPIKeyCopies(t *testing.T) {
 	continuationBody := []byte(`{"thread":{"type":"continue","previous_message_id":"msg-shared"}}`)
 	cases := map[string]cliproxyauth.APIKeyConfigExecutor{
 		"claude": NewClaudeExecutor(&config.Config{}),
+		"kimi":   NewKimiExecutor(&config.Config{}),
 	}
 	for name, registered := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -41,6 +42,8 @@ func claudeExecutorForAliasTest(t *testing.T, scoped cliproxyauth.ProviderExecut
 	switch executor := scoped.(type) {
 	case *ClaudeExecutor:
 		return executor
+	case *KimiExecutor:
+		return &executor.ClaudeExecutor
 	default:
 		t.Fatalf("unexpected scoped executor %T", scoped)
 		return nil

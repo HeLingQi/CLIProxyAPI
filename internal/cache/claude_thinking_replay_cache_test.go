@@ -3,71 +3,13 @@ package cache
 import (
 	"bytes"
 	"context"
-	"sync"
 	"testing"
-	"time"
-
-	homekv "github.com/router-for-me/CLIProxyAPI/v8/internal/home"
 )
 
-type fakeClaudeReplayKVClient struct {
-	mu     sync.Mutex
-	values map[string][]byte
-}
-
-func newFakeClaudeReplayKVClient() *fakeClaudeReplayKVClient {
-	return &fakeClaudeReplayKVClient{values: make(map[string][]byte)}
-}
-
-func (c *fakeClaudeReplayKVClient) KVGet(_ context.Context, key string) ([]byte, bool, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	value, found := c.values[key]
-	return append([]byte(nil), value...), found, nil
-}
-
-func (c *fakeClaudeReplayKVClient) KVSet(_ context.Context, key string, value []byte, _ homekv.KVSetOptions) (bool, error) {
-	c.mu.Lock()
-	c.values[key] = append([]byte(nil), value...)
-	c.mu.Unlock()
-	return true, nil
-}
-
-func (c *fakeClaudeReplayKVClient) KVDel(_ context.Context, keys ...string) (int64, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	var deleted int64
-	for _, key := range keys {
-		if _, found := c.values[key]; found {
-			delete(c.values, key)
-			deleted++
-		}
-	}
-	return deleted, nil
-}
-
-func (c *fakeClaudeReplayKVClient) KVCompareAndSwap(_ context.Context, key string, expected []byte, expectedExists bool, value []byte, _ time.Duration) (bool, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	current, found := c.values[key]
-	if found != expectedExists || (found && !bytes.Equal(current, expected)) {
-		return false, nil
-	}
-	c.values[key] = append([]byte(nil), value...)
-	return true, nil
-}
-
-func (c *fakeClaudeReplayKVClient) KVExpire(_ context.Context, key string, _ time.Duration) (bool, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	_, found := c.values[key]
-	return found, nil
-}
-
-func useFakeClaudeThinkingReplayKVClient(t *testing.T, client *fakeClaudeReplayKVClient) {
+func useFakeClaudeThinkingReplayKVClient(t *testing.T, client *fakeKimiThinkingReplayKVClient) {
 	t.Helper()
 	previous := currentClaudeThinkingReplayKVClient
-	currentClaudeThinkingReplayKVClient = func() (claudeThinkingReplayKVClient, bool, error) {
+	currentClaudeThinkingReplayKVClient = func() (kimiThinkingReplayKVClient, bool, error) {
 		return client, true, nil
 	}
 	t.Cleanup(func() {
@@ -76,7 +18,7 @@ func useFakeClaudeThinkingReplayKVClient(t *testing.T, client *fakeClaudeReplayK
 }
 
 func TestClaudeThinkingReplayAppendsAssistantTurns(t *testing.T) {
-	client := newFakeClaudeReplayKVClient()
+	client := newFakeKimiThinkingReplayKVClient()
 	useFakeClaudeThinkingReplayKVClient(t, client)
 
 	const modelFamily = "claude:auth:model"
@@ -102,5 +44,46 @@ func TestClaudeThinkingReplayAppendsAssistantTurns(t *testing.T) {
 	}
 	if !bytes.Equal(contents[0], first) || !bytes.Equal(contents[1], second) {
 		t.Fatalf("Claude replay contents lost ordering: got %s / %s", contents[0], contents[1])
+	}
+}
+
+func TestClaudeThinkingReplayClearDoesNotClearKimiState(t *testing.T) {
+	previousClaudeClient := currentClaudeThinkingReplayKVClient
+	previousKimiClient := currentKimiThinkingReplayKVClient
+	currentClaudeThinkingReplayKVClient = func() (kimiThinkingReplayKVClient, bool, error) {
+		return nil, false, nil
+	}
+	currentKimiThinkingReplayKVClient = func() (kimiThinkingReplayKVClient, bool, error) {
+		return nil, false, nil
+	}
+	t.Cleanup(func() {
+		currentClaudeThinkingReplayKVClient = previousClaudeClient
+		currentKimiThinkingReplayKVClient = previousKimiClient
+	})
+	ClearClaudeThinkingReplayCache()
+	ClearKimiThinkingReplayCache()
+	t.Cleanup(ClearClaudeThinkingReplayCache)
+	t.Cleanup(ClearKimiThinkingReplayCache)
+
+	const modelFamily = "shared-model"
+	const sessionKey = "execution:shared-session"
+	kimiContent := []byte(`[{"type":"thinking","signature":"kimi"}]`)
+	claudeContent := []byte(`[{"type":"thinking","signature":"claude"}]`)
+	if !CacheKimiThinkingReplayBestEffort(context.Background(), modelFamily, sessionKey, kimiContent) {
+		t.Fatal("failed to seed Kimi replay state")
+	}
+	if !CacheClaudeThinkingReplayBestEffort(context.Background(), modelFamily, sessionKey, claudeContent) {
+		t.Fatal("failed to seed Claude replay state")
+	}
+
+	ClearClaudeThinkingReplayCache()
+
+	gotKimi, foundKimi, errKimi := GetKimiThinkingReplayRequired(context.Background(), modelFamily, sessionKey)
+	if errKimi != nil || !foundKimi || !bytes.Equal(gotKimi, kimiContent) {
+		t.Fatalf("Kimi replay after Claude clear = %s, found %v, error %v; want preserved state", gotKimi, foundKimi, errKimi)
+	}
+	gotClaude, foundClaude, errClaude := GetClaudeThinkingReplayRequired(context.Background(), modelFamily, sessionKey)
+	if errClaude != nil || foundClaude || len(gotClaude) != 0 {
+		t.Fatalf("Claude replay after Claude clear = %d turns, found %v, error %v; want cleared state", len(gotClaude), foundClaude, errClaude)
 	}
 }

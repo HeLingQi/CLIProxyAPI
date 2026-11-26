@@ -3,7 +3,6 @@ package pluginhost
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/MoeForge/moego/json"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 	log "github.com/sirupsen/logrus"
@@ -37,6 +37,7 @@ type rpcFrontendAuthProvider struct {
 
 type rpcProviderExecutor struct {
 	*rpcPluginAdapter
+	registeredIdentifier *string
 }
 
 type rpcThinkingApplier struct {
@@ -146,6 +147,7 @@ func registerRPCPlugin(ctx context.Context, host *Host, id string, client plugin
 		Capabilities: pluginapi.Capabilities{
 			FrontendAuthProviderExclusive: resp.Capabilities.FrontendAuthProvider && resp.Capabilities.FrontendAuthProviderExclusive,
 			ExecutorModelScope:            resp.Capabilities.ExecutorModelScope,
+			ExecutorAuthProviders:         append([]string(nil), resp.Capabilities.ExecutorAuthProviders...),
 			ExecutorInputFormats:          append([]string(nil), resp.Capabilities.ExecutorInputFormats...),
 			ExecutorOutputFormats:         append([]string(nil), resp.Capabilities.ExecutorOutputFormats...),
 		},
@@ -182,11 +184,24 @@ func registerRPCPlugin(ctx context.Context, host *Host, id string, client plugin
 		plugin.Capabilities.Scheduler = adapter
 		plugin.Capabilities.SchedulerAcrossPriorities = resp.Capabilities.SchedulerAcrossPriorities
 	}
+	if resp.Capabilities.SchedulerContinuity {
+		plugin.Capabilities.SchedulerContinuity = adapter
+	}
 	if resp.Capabilities.ModelRouter {
 		plugin.Capabilities.ModelRouter = adapter
 	}
 	if resp.Capabilities.Executor {
-		plugin.Capabilities.Executor = rpcProviderExecutor{rpcPluginAdapter: adapter}
+		executor := rpcProviderExecutor{rpcPluginAdapter: adapter}
+		if len(plugin.Capabilities.ExecutorAuthProviders) != 0 {
+			// Home dispatch advertises plugin readiness without calling into plugin code.
+			respIdentifier, errIdentifier := callPlugin[rpcIdentifierResponse](ctx, client, pluginabi.MethodExecutorIdentifier, rpcEmptyResponse{})
+			if errIdentifier != nil {
+				return pluginapi.Plugin{}, fmt.Errorf("register plugin %s executor identifier: %w", id, errIdentifier)
+			}
+			identifier := strings.TrimSpace(respIdentifier.Identifier)
+			executor.registeredIdentifier = &identifier
+		}
+		plugin.Capabilities.Executor = executor
 	}
 	if resp.Capabilities.RequestTranslator {
 		plugin.Capabilities.RequestTranslator = adapter
@@ -312,6 +327,9 @@ func sanitizePluginRequest(request any) any {
 		for index := range req.Candidates {
 			req.Candidates[index].Metadata = sanitizePluginMetadata(req.Candidates[index].Metadata)
 		}
+		return req
+	case pluginapi.SchedulerContinuityRequest:
+		req.Options.Metadata = sanitizePluginMetadata(req.Options.Metadata)
 		return req
 	case pluginapi.ModelRouteRequest:
 		req.Metadata = sanitizePluginMetadata(req.Metadata)
@@ -512,6 +530,10 @@ func (a *rpcPluginAdapter) Pick(ctx context.Context, req pluginapi.SchedulerPick
 	return callPlugin[pluginapi.SchedulerPickResponse](ctx, a.client, pluginabi.MethodSchedulerPick, req)
 }
 
+func (a *rpcPluginAdapter) Continuity(ctx context.Context, req pluginapi.SchedulerContinuityRequest) (pluginapi.SchedulerContinuityResponse, error) {
+	return callPlugin[pluginapi.SchedulerContinuityResponse](ctx, a.client, pluginabi.MethodSchedulerContinuity, req)
+}
+
 func (a *rpcPluginAdapter) RouteModel(ctx context.Context, req pluginapi.ModelRouteRequest) (pluginapi.ModelRouteResponse, error) {
 	callbackID, closeCallback := a.openHostCallbackContext(ctx)
 	defer closeCallback()
@@ -611,6 +633,9 @@ func (a rpcFrontendAuthProvider) Identifier() string {
 }
 
 func (a rpcProviderExecutor) Identifier() string {
+	if a.registeredIdentifier != nil {
+		return *a.registeredIdentifier
+	}
 	return callPluginIdentifier(context.Background(), a.client, pluginabi.MethodExecutorIdentifier)
 }
 

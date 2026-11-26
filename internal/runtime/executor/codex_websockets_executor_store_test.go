@@ -65,6 +65,21 @@ func TestManagerRegisterExecutor_PreservesSharedWebsocketSessionsAcrossExecutorR
 				return exec.(*CodexAutoExecutor).wsExec.getOrCreateSession(sessionID)
 			},
 		},
+		{
+			name:  "XAIAutoExecutor",
+			store: globalXAIWebsocketSessionStore,
+			newExecutor: func(cfg *config.Config) cliproxyauth.ProviderExecutor {
+				return NewXAIAutoExecutor(cfg)
+			},
+			newIsolatedExecutor: func(cfg *config.Config) cliproxyauth.ProviderExecutor {
+				exec := NewXAIAutoExecutor(cfg)
+				exec.wsExec.store = &codexWebsocketSessionStore{sessions: make(map[string]*codexWebsocketSession)}
+				return exec
+			},
+			getSession: func(exec cliproxyauth.ProviderExecutor, sessionID string) *codexWebsocketSession {
+				return exec.(*XAIAutoExecutor).wsExec.getOrCreateSession(sessionID)
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -134,6 +149,17 @@ func TestManagerRemove_ClosesOnlyRemovedAuthWebsocketSessions(t *testing.T) {
 			},
 			getSession: func(exec cliproxyauth.ProviderExecutor, sessionID string) *codexWebsocketSession {
 				return exec.(*CodexAutoExecutor).wsExec.getOrCreateSession(sessionID)
+			},
+		},
+		{
+			name:     "XAIAutoExecutor",
+			provider: "xai",
+			store:    globalXAIWebsocketSessionStore,
+			newExecutor: func(cfg *config.Config) cliproxyauth.ProviderExecutor {
+				return NewXAIAutoExecutor(cfg)
+			},
+			getSession: func(exec cliproxyauth.ProviderExecutor, sessionID string) *codexWebsocketSession {
+				return exec.(*XAIAutoExecutor).wsExec.getOrCreateSession(sessionID)
 			},
 		},
 	}

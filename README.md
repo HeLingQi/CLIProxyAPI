@@ -49,7 +49,7 @@ CLIProxyAPI 是一个为 CLI 提供 OpenAI/Gemini/Claude/Codex 兼容 API 接口
 - **核心语言与运行时**：Go `1.27.4`（模块 `github.com/router-for-me/CLIProxyAPI/v8`）
 - **HTTP 与路由框架**：Gin（`github.com/gin-gonic/gin`）
 - **终端界面（TUI）**：Bubbletea + Bubbles + Lipgloss（支持 `--tui` / `--standalone`）
-- **协议、流式与实时通信**：`gorilla/websocket`、`pion/webrtc/v4`、`refraction-networking/utls`、`MoeForge/moego`（`ojson` / `base64`）
+- **协议、流式与实时通信**：`gorilla/websocket`、`pion/webrtc/v4`、`refraction-networking/utls`、`MoeForge/moego`（`json` / `ojson` / `base64` / `regexp`）
 - **持久化与外部存储**：本地文件 / BoltDB（默认）、PostgreSQL（`pgx/v5`）、Redis（`go-redis/v9`）、Git 仓库（`go-git/v6`）、S3/对象存储（`minio-go/v7`）
 - **插件扩展**：基于 C ABI 的动态库插件系统（提供 Go / C / Rust 插件示例）
 
@@ -64,7 +64,8 @@ CLIProxyAPI/
 │   └── validate_codex_models/      # Codex 模型校验工具
 ├── internal/
 │   ├── api/                        # Gin HTTP 服务、路由、中间件与协议复用
-│   ├── auth/                       # 各上游提供商 OAuth 与凭据管理（antigravity/claude/codex/vertex）
+│   ├── antigravitycatalog/         # Antigravity 模型目录与 Hub 版本元数据
+│   ├── auth/                       # 各上游提供商 OAuth 与凭据管理（antigravity/claude/codex/vertex 等）
 │   ├── runtime/executor/           # 各提供商运行时执行器（含 Codex WebSocket）
 │   ├── translator/                 # OpenAI / Gemini / Claude / Codex / Antigravity 协议转换
 │   ├── thinking/                   # 统一 Thinking / Reasoning 解析与提供商适配管线
@@ -75,7 +76,7 @@ CLIProxyAPI/
 │   ├── watcher/                    # 配置与凭据热重载监听
 │   ├── pluginhost/ & pluginstore/  # 原生动态库插件宿主加载与存储管理
 │   ├── home/ & homeplugins/        # CLIProxyAPIHome 控制面接入与协调
-│   ├── wsrelay/                    # WebSocket 中继会话管理
+│   ├── wsrelay/ & wstunnel/        # WebSocket 中继会话与隧道管理
 │   └── tui/                        # Bubbletea 交互式终端界面
 ├── sdk/                            # 可嵌入外部 Go 项目的公开 SDK（cliproxy/translator/pluginabi 等）
 ├── docs/                           # SDK、Management API v8、局域网发现、定价同步等文档

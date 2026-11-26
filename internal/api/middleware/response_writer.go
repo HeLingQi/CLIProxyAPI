@@ -413,6 +413,15 @@ func (w *ResponseWriterWrapper) Finalize(c *gin.Context) error {
 		return errDiscard
 	}
 
+	// Local diagnostics must not turn a recovered retry or client cancellation into an error response.
+	capture := w.deferredAPICapture
+	if capture == nil {
+		if value, exists := c.Get(logging.DeferredAPIResponseContextKey); exists {
+			capture, _ = value.(*logging.DeferredAPICapture)
+		}
+	}
+	slicesAPIResponseError = append(slicesAPIResponseError, capture.ResponseDiagnostics()...)
+
 	if w.isStreaming && w.streamWriter != nil {
 		if w.chunkChannel != nil {
 			close(w.chunkChannel)
@@ -496,7 +505,8 @@ func (w *ResponseWriterWrapper) Finalize(c *gin.Context) error {
 	}
 	apiResponse := w.extractAPIResponse(c)
 	if forceLog {
-		if deferredResponse := w.extractDeferredAPIResponse(c); len(deferredResponse) > 0 {
+		// An upstream attempt without a response must not fall back to a synthesized handler error.
+		if deferredResponse := w.extractDeferredAPIResponse(c); len(deferredResponse) > 0 || len(apiRequest) > 0 {
 			apiResponse = deferredResponse
 		}
 	}
@@ -591,9 +601,23 @@ func (w *ResponseWriterWrapper) closeDeferredAPICapture(c *gin.Context) {
 			closer.Close()
 		}
 	}
+	if value, exists := c.Get(logging.APIResponseSnapshotterContextKey); exists {
+		if closer, ok := value.(interface{ Close() }); ok && closer != nil {
+			closer.Close()
+		}
+	}
 }
 
 func (w *ResponseWriterWrapper) extractAPIResponse(c *gin.Context) []byte {
+	if c != nil {
+		if value, exists := c.Get(logging.APIResponseSnapshotterContextKey); exists {
+			if snapshotter, ok := value.(logging.APIResponseSnapshotter); ok && snapshotter != nil {
+				if data := snapshotter.SnapshotAPIResponse(); len(data) > 0 {
+					return data
+				}
+			}
+		}
+	}
 	apiResponse, isExist := c.Get("API_RESPONSE")
 	if !isExist {
 		return nil
@@ -995,6 +1019,11 @@ func hasRecordedUpstreamActivity(c *gin.Context) bool {
 	}
 	if value, exists := c.Get(logging.DeferredAPIRequestContextKey); exists {
 		if requests, ok := value.([]logging.DeferredAPIRequest); ok && len(requests) > 0 {
+			return true
+		}
+	}
+	if value, exists := c.Get(logging.APIResponseSnapshotterContextKey); exists {
+		if snapshotter, ok := value.(logging.APIResponseSnapshotter); ok && snapshotter != nil && len(snapshotter.SnapshotAPIResponse()) > 0 {
 			return true
 		}
 	}

@@ -4,10 +4,8 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/MoeForge/moego/base64"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -15,6 +13,9 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/MoeForge/moego/base64"
+	"github.com/MoeForge/moego/json"
 
 	"github.com/MoeForge/moego/ojson"
 	"github.com/andybalholm/brotli"
@@ -28,6 +29,7 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/session"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
+	log "github.com/sirupsen/logrus"
 )
 
 func resetClaudeDeviceProfileCache() {
@@ -5075,6 +5077,53 @@ func TestRelocateClaudeSystemPromptForCountTokensKeepsBlocksSeparate(t *testing.
 	}
 }
 
+func TestClaudeAdvisorDeclarationKeepsCallerSystemPlacementStable(t *testing.T) {
+	base := `{
+		"model": "claude-opus-5",
+		"system": [{"type": "text", "text": "caller guidance"}],
+		"tools": [{"type": "advisor_20260301", "name": "advisor"}],
+		"messages": [{"role": "user", "content": "hello"}]
+	}`
+	withAdvisorResult := `{
+		"model": "claude-opus-5",
+		"system": [{"type": "text", "text": "caller guidance"}],
+		"tools": [{"type": "advisor_20260301", "name": "advisor"}],
+		"messages": [
+			{"role": "user", "content": "hello"},
+			{"role": "assistant", "content": [{"type": "server_tool_use", "id": "srvtoolu_adv1", "name": "advisor", "input": {}}]},
+			{"role": "user", "content": [{"type": "advisor_tool_result", "tool_use_id": "srvtoolu_adv1", "content": {"type": "advisor_redacted_result", "encrypted_content": "ciphertext123"}}]}
+		]
+	}`
+
+	for _, test := range []struct {
+		name    string
+		payload string
+	}{
+		{name: "before advisor call", payload: base},
+		{name: "after advisor result", payload: withAdvisorResult},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			out := checkSystemInstructionsWithMode([]byte(test.payload), false)
+			if got := ojson.GetBytes(out, "messages.#").Int(); got != int64(len(ojson.GetBytes([]byte(test.payload), "messages").Array())) {
+				t.Fatalf("messages count changed with advisor declaration: got %d: %s", got, out)
+			}
+			if got := ojson.GetBytes(out, "system.2.text").String(); got != "caller guidance" {
+				t.Fatalf("system caller block = %q, want top-level caller guidance: %s", got, out)
+			}
+		})
+	}
+
+	t.Run("count tokens", func(t *testing.T) {
+		out := relocateClaudeSystemPromptForCountTokens([]byte(base), false)
+		if got := ojson.GetBytes(out, "messages.#").Int(); got != 1 {
+			t.Fatalf("count_tokens message count = %d, want 1 without system splice: %s", got, out)
+		}
+		if got := ojson.GetBytes(out, "system.0.text").String(); got != "caller guidance" {
+			t.Fatalf("count_tokens caller system = %q, want caller guidance in top-level system: %s", got, out)
+		}
+	})
+}
+
 func TestCheckSystemInstructionsWithMode_AdvisorToolResultPreservesTopLevelSystemAndKeepsMessagesIntact(t *testing.T) {
 	payload := []byte(`{
 		"model": "claude-opus-5",
@@ -5928,6 +5977,48 @@ func TestClaudeCloakSensitiveWordsReplaceFromYAML(t *testing.T) {
 	}
 }
 
+func TestClaudeCloakSensitivePatternsReplaceFromYAML(t *testing.T) {
+	cfg, errParse := config.ParseConfigBytes([]byte(`claude-api-key:
+  - api-key: "key-pattern-123"
+    cloak:
+      mode: "always"
+      sensitive-words:
+        - "proxy"
+      sensitive-patterns-replace:
+        - pattern: '(?m)^You are omp[^\n]*\n?'
+          replacement: ""
+        - pattern: 'Claude\s+Code'
+          replacement: "Claude"
+`))
+	if errParse != nil {
+		t.Fatalf("ParseConfigBytes() error = %v", errParse)
+	}
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "key-pattern-123"}}
+	payload := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"You are omp's agent.\nUse Claude  Code through proxy."}]}]}`)
+
+	out, cloaked, errCloaking := applyCloaking(
+		context.Background(),
+		cfg,
+		auth,
+		payload,
+		"key-pattern-123",
+		false,
+		false,
+	)
+	if errCloaking != nil {
+		t.Fatalf("applyCloaking() error = %v", errCloaking)
+	}
+	if !cloaked {
+		t.Fatal("applyCloaking() cloaked = false, want true")
+	}
+	content := ojson.GetBytes(out, "messages.0.content").Array()
+	got := content[len(content)-1].Get("text").String()
+	want := "Use Claude through p\u200Broxy."
+	if got != want {
+		t.Fatalf("user message = %q, want %q", got, want)
+	}
+}
+
 func TestClaudeOAuthMetadataSensitiveWordsReplaceAndDisabledCloaking(t *testing.T) {
 	auth := &cliproxyauth.Auth{
 		Attributes: map[string]string{"api_key": "sk-ant-oat-replace-test"},
@@ -5967,6 +6058,96 @@ func TestClaudeOAuthMetadataSensitiveWordsReplaceAndDisabledCloaking(t *testing.
 	}
 	if !strings.Contains(string(outNever), "You are Codex, an agent based on GPT-5.") {
 		t.Fatalf("disabled cloaking should preserve cleartext, got: %s", outNever)
+	}
+
+	authPattern := &cliproxyauth.Auth{
+		Attributes: map[string]string{"api_key": "sk-ant-oat-pattern-test"},
+		Metadata: map[string]any{
+			"cloak_mode": "always",
+			"cloak_sensitive_patterns_replace": []map[string]any{
+				{"pattern": `(?m)^You are omp[^\n]*\n?`, "replacement": ""},
+			},
+		},
+	}
+	patternPayload := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"You are omp's assistant.\nKeep me."}]}]}`)
+	outPattern, cloakedPattern, errPattern := applyCloaking(context.Background(), &config.Config{}, authPattern, patternPayload, "sk-ant-oat-pattern-test", false, false)
+	if errPattern != nil {
+		t.Fatalf("applyCloaking(patterns) error = %v", errPattern)
+	}
+	if !cloakedPattern {
+		t.Fatal("expected cloaked = true for pattern metadata")
+	}
+	patternContent := ojson.GetBytes(outPattern, "messages.0.content").Array()
+	if got := patternContent[len(patternContent)-1].Get("text").String(); got != "Keep me." {
+		t.Fatalf("rewritten pattern message = %q, want %q", got, "Keep me.")
+	}
+
+	// Verify matcher cache reuse and single invalid-regex log across repeated resolutions.
+	claudeMatcherCacheMu.Lock()
+	savedCache := claudeMatcherCache
+	savedOrder := claudeMatcherCacheOrder
+	claudeMatcherCache = make(map[string]*helps.SensitiveWordMatcher)
+	claudeMatcherCacheOrder = nil
+	claudeMatcherCacheMu.Unlock()
+	t.Cleanup(func() {
+		claudeMatcherCacheMu.Lock()
+		claudeMatcherCache = savedCache
+		claudeMatcherCacheOrder = savedOrder
+		claudeMatcherCacheMu.Unlock()
+	})
+
+	var logBuf bytes.Buffer
+	origOut := log.StandardLogger().Out
+	log.SetOutput(&logBuf)
+	defer log.SetOutput(origOut)
+
+	authInvalid := &cliproxyauth.Auth{
+		Attributes: map[string]string{"api_key": "sk-ant-oat-invalid-cache-test"},
+		Metadata: map[string]any{
+			"cloak_mode": "always",
+			"cloak_sensitive_patterns_replace": []map[string]any{
+				{"pattern": `[invalid-claude-cache-test`, "replacement": ""},
+				{"pattern": `(?m)^DropMe[^\n]*\n?`, "replacement": ""},
+			},
+		},
+	}
+	_, settings1 := resolveClaudeWirePolicy(&config.Config{}, authInvalid, "sk-ant-oat-invalid-cache-test", false)
+	_, settings2 := resolveClaudeWirePolicy(&config.Config{}, authInvalid, "sk-ant-oat-invalid-cache-test", false)
+	m1 := settings1.buildSensitiveWordMatcher()
+	m2 := settings2.buildSensitiveWordMatcher()
+	if m1 == nil || m1 != m2 {
+		t.Fatalf("expected cached Claude matcher reuse, got m1=%p m2=%p", m1, m2)
+	}
+	if warnCount := strings.Count(logBuf.String(), "invalid-claude-cache-test"); warnCount != 1 {
+		t.Fatalf("expected 1 invalid-regex warning across repeated resolutions, got %d in %q", warnCount, logBuf.String())
+	}
+
+	// Verify Home credential_options.cloak.sensitive-patterns-replace end-to-end.
+	homeAuth := &cliproxyauth.Auth{
+		Attributes: map[string]string{"api_key": "sk-ant-home-pattern-test"},
+		Metadata: map[string]any{
+			"credential_options": map[string]any{
+				"cloak": map[string]any{
+					"mode": "always",
+					"sensitive-patterns-replace": []map[string]any{
+						{"pattern": `(?m)^You are omp[^\n]*\n?`, "replacement": ""},
+					},
+				},
+			},
+		},
+	}
+	homeCfg := &config.Config{Home: config.HomeConfig{Enabled: true}}
+	homePayload := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"You are omp's assistant.\nKeep Home rule."}]}]}`)
+	outHome, cloakedHome, errHome := applyCloaking(context.Background(), homeCfg, homeAuth, homePayload, "sk-ant-home-pattern-test", false, false)
+	if errHome != nil {
+		t.Fatalf("applyCloaking(home patterns) error = %v", errHome)
+	}
+	if !cloakedHome {
+		t.Fatal("expected cloaked = true for Home cloak patterns")
+	}
+	homeContent := ojson.GetBytes(outHome, "messages.0.content").Array()
+	if got := homeContent[len(homeContent)-1].Get("text").String(); got != "Keep Home rule." {
+		t.Fatalf("Home pattern message = %q, want %q", got, "Keep Home rule.")
 	}
 }
 
@@ -10991,5 +11172,61 @@ func TestClaudeExecutor_PayloadFilterRemovesPreservedThinkingInjection(t *testin
 	seenBody, _ := runClaudeExecutorCapture(t, cfg, "", false, "claude-haiku-5-5", preservedThinkingReplayPayload("claude-haiku-5-5"))
 	if ojson.GetBytes(seenBody, "thinking.block_binding").Exists() {
 		t.Fatalf("payload filter must remove injected block_binding: %s", seenBody)
+	}
+}
+
+func TestStripTranslatedDefaultMaxTokens_GeminiSnakeCaseAndInvalidValues_Issue8112(t *testing.T) {
+	translated := []byte(`{"model":"claude-sonnet-4-6","max_tokens":32000,"messages":[]}`)
+
+	cases := []struct {
+		name       string
+		original   string
+		wantExists bool
+	}{
+		{
+			name:       "snake_case generation_config.max_output_tokens keeps max_tokens",
+			original:   `{"generation_config":{"max_output_tokens":2048}}`,
+			wantExists: true,
+		},
+		{
+			name:       "mixed generationConfig.max_output_tokens keeps max_tokens",
+			original:   `{"generationConfig":{"max_output_tokens":2048}}`,
+			wantExists: true,
+		},
+		{
+			name:       "null maxOutputTokens strips default max_tokens",
+			original:   `{"generationConfig":{"maxOutputTokens":null}}`,
+			wantExists: false,
+		},
+		{
+			name:       "zero maxOutputTokens strips default max_tokens",
+			original:   `{"generationConfig":{"maxOutputTokens":0}}`,
+			wantExists: false,
+		},
+		{
+			name:       "zero maxOutputTokens with positive max_output_tokens keeps max_tokens",
+			original:   `{"generationConfig":{"maxOutputTokens":0,"max_output_tokens":2048}}`,
+			wantExists: true,
+		},
+		{
+			name:       "camel generationConfig with zero does not fall through to sibling generation_config",
+			original:   `{"generationConfig":{"maxOutputTokens":0},"generation_config":{"max_output_tokens":2048}}`,
+			wantExists: false,
+		},
+		{
+			name:       "non-numeric max_output_tokens strips default max_tokens",
+			original:   `{"generation_config":{"max_output_tokens":"2048"}}`,
+			wantExists: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out := stripTranslatedDefaultMaxTokens(sdktranslator.FormatGemini, []byte(tc.original), translated)
+			gotExists := ojson.GetBytes(out, "max_tokens").Exists()
+			if gotExists != tc.wantExists {
+				t.Fatalf("max_tokens exists = %v, want %v; out=%s", gotExists, tc.wantExists, out)
+			}
+		})
 	}
 }

@@ -49,7 +49,7 @@ func (w *compressionHijackRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error
 
 func TestWebsocketCompressionRoundTrip(t *testing.T) {
 	enabled, disabled := true, false
-	for _, provider := range []string{"codex"} {
+	for _, provider := range []string{"codex", "xai"} {
 		for _, tc := range []struct {
 			name string
 			cfg  *config.Config
@@ -85,7 +85,15 @@ func TestWebsocketCompressionRoundTrip(t *testing.T) {
 				defer server.Close()
 				wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
 				auth := &cliproxyauth.Auth{ProxyURL: "direct"}
-				conn, closer, response, errDial := NewCodexWebsocketsExecutor(tc.cfg).dialCodexWebsocket(context.Background(), auth, wsURL, nil)
+				var conn *websocket.Conn
+				var closer *websocketConnectionCloser
+				var response *http.Response
+				var errDial error
+				if provider == "codex" {
+					conn, closer, response, errDial = NewCodexWebsocketsExecutor(tc.cfg).dialCodexWebsocket(context.Background(), auth, wsURL, nil)
+				} else {
+					conn, closer, response, errDial = NewXAIWebsocketsExecutor(tc.cfg).dialXAIWebsocket(context.Background(), auth, wsURL, nil)
+				}
 				if errDial != nil {
 					t.Fatal(errDial)
 				}

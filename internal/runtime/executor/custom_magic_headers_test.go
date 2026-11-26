@@ -344,6 +344,50 @@ func TestCustomMagicHeaders_GeminiVertex(t *testing.T) {
 	}
 }
 
+func TestCustomMagicHeaders_XAI(t *testing.T) {
+	var gotHeaders http.Header
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeaders = r.Header.Clone()
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"created_at\":0,\"status\":\"completed\",\"background\":false,\"error\":null,\"output\":[]}}\n\n"))
+	}))
+	defer server.Close()
+
+	executor := NewXAIExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		Provider: "xai",
+		Attributes: map[string]string{
+			"base_url":                        server.URL,
+			"api_key":                         "xai-key",
+			"header:X-Claude-Code-Session-Id": "$ABC",
+			"header:X-Missing":                "$NONEXISTENT",
+		},
+	}
+
+	req := cliproxyexecutor.Request{
+		Model:   "grok-2",
+		Payload: []byte(`{"messages":[{"role":"user","content":"hi"}]}`),
+	}
+	opts := cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FormatOpenAI,
+		Headers: http.Header{
+			"ABC": []string{"xai-session-value"},
+		},
+	}
+
+	_, err := executor.Execute(context.Background(), auth, req, opts)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	if got := gotHeaders.Get("X-Claude-Code-Session-Id"); got != "xai-session-value" {
+		t.Errorf("X-Claude-Code-Session-Id = %q, want %q", got, "xai-session-value")
+	}
+	if _, exists := gotHeaders["X-Missing"]; exists {
+		t.Errorf("expected X-Missing to be omitted, got %q", gotHeaders.Get("X-Missing"))
+	}
+}
+
 func TestCustomMagicHeaders_Claude(t *testing.T) {
 	var gotHeaders http.Header
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -714,6 +758,47 @@ func TestCustomMagicHeaders_CPASessionID_Codex(t *testing.T) {
 	}
 
 	wantSession := "codex:codex-sess-uuid"
+	if got := gotHeaders.Get("X-Session"); got != wantSession {
+		t.Errorf("X-Session = %q, want %q", got, wantSession)
+	}
+}
+
+func TestCustomMagicHeaders_CPASessionID_XAI(t *testing.T) {
+	var gotHeaders http.Header
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeaders = r.Header.Clone()
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"created_at\":0,\"status\":\"completed\",\"background\":false,\"error\":null,\"output\":[]}}\n\n"))
+	}))
+	defer server.Close()
+
+	executor := NewXAIExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		Provider: "xai",
+		Attributes: map[string]string{
+			"base_url":         server.URL,
+			"api_key":          "xai-key",
+			"header:X-Session": "$CPA-SESSION-ID",
+		},
+	}
+
+	req := cliproxyexecutor.Request{
+		Model:   "grok-2",
+		Payload: []byte(`{"messages":[{"role":"user","content":"hi"}]}`),
+	}
+	opts := cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FormatOpenAI,
+		Headers: http.Header{
+			"X-Session-ID": []string{"xai-sess-111"},
+		},
+	}
+
+	_, err := executor.Execute(context.Background(), auth, req, opts)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	wantSession := "header:xai-sess-111"
 	if got := gotHeaders.Get("X-Session"); got != wantSession {
 		t.Errorf("X-Session = %q, want %q", got, wantSession)
 	}

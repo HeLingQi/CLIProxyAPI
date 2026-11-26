@@ -31,12 +31,8 @@ func TestAntigravityDecoratorRunsAfterCredentialHTTP11PoolSelection(t *testing.T
 				calls++
 				selected = next
 				tr, ok := next.(*http.Transport)
-				offered := []string(nil)
-				if ok && tr.TLSClientConfig != nil {
-					offered = tr.TLSClientConfig.NextProtos
-				}
-				if !ok || tr.TLSClientConfig == nil || !tr.ForceAttemptHTTP2 || tr.TLSNextProto != nil || len(offered) != 2 || offered[0] != "h2" || offered[1] != "http/1.1" {
-					t.Fatal("decorator preceded the credential pool selection")
+				if !ok || tr.ForceAttemptHTTP2 || len(tr.TLSNextProto) != 0 || tr.TLSClientConfig == nil || len(tr.TLSClientConfig.NextProtos) != 0 {
+					t.Fatal("decorator preceded HTTP/1.1 selection")
 				}
 				return &auditTestTransport{RoundTripper: next}
 			})

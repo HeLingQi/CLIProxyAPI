@@ -155,11 +155,11 @@ func TestPluginStaticModelAvailabilityFollowsCredentials(t *testing.T) {
 }
 
 func TestRegisterModelsForAuth_PluginStaticExclusionsDoNotMatchNativeAliases(t *testing.T) {
-	const provider = "claude"
+	const provider = "kimi"
 	const nativeAlias = "native-alias"
-	catalog := registry.GetClaudeModels()
+	catalog := registry.GetKimiModels()
 	if len(catalog) == 0 {
-		t.Fatal("claude catalog is empty")
+		t.Fatal("kimi catalog is empty")
 	}
 	cfg := &config.Config{
 		OAuthExcludedModels: map[string][]string{provider: {pluginStaticGlobalModel, nativeAlias}},

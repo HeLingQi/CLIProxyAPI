@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"bytes"
 	"context"
 	"testing"
 	"time"
@@ -8,7 +9,10 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
+	"google.golang.org/protobuf/encoding/protowire"
 )
 
 type multiProviderUsageCapture struct {
@@ -139,5 +143,165 @@ func TestGeminiInteractionsUsageRecordCarriesResponseModel(t *testing.T) {
 	}
 	if record.ResponseModel != "gemini-3.1-flash-lite" {
 		t.Fatalf("record response model = %q, want gemini-3.1-flash-lite", record.ResponseModel)
+	}
+}
+
+func TestDevinStreamRecordsResponseModelFromUsage(t *testing.T) {
+	const alias = "devin-stream-response-model-test"
+	capture := &multiProviderUsageCapture{alias: alias, records: make(chan coreusage.Record, 4)}
+	coreusage.RegisterNamedPlugin(t.Name(), capture)
+	t.Cleanup(func() {
+		coreusage.RegisterNamedPlugin(t.Name(), multiProviderNoopUsagePlugin{})
+	})
+
+	ctx := coreusage.WithRequestedModelAlias(context.Background(), alias)
+	auth := &cliproxyauth.Auth{ID: "devin-auth-1", Index: "auth-devin-1", Provider: "devin"}
+	exec := NewDevinExecutor(&config.Config{})
+	reporter := helps.NewExecutorUsageReporter(ctx, exec, "devin/swe-2", auth)
+
+	var f7 []byte
+	f7 = protowire.AppendTag(f7, 2, protowire.VarintType)
+	f7 = protowire.AppendVarint(f7, 10)
+	f7 = protowire.AppendTag(f7, 3, protowire.VarintType)
+	f7 = protowire.AppendVarint(f7, 20)
+	f7 = protowire.AppendTag(f7, 9, protowire.BytesType)
+	f7 = protowire.AppendString(f7, "gpt-5-6-luna-low")
+
+	var f1 []byte
+	f1 = protowire.AppendTag(f1, 7, protowire.BytesType)
+	f1 = protowire.AppendBytes(f1, f7)
+
+	var buf bytes.Buffer
+	buf.Write(helps.WrapConnectEnvelope(f1))
+	buf.Write(helps.WrapConnectEnvelopeWithFlag(helps.ConnectFlagEndStream, []byte(`{}`)))
+
+	out := make(chan cliproxyexecutor.StreamChunk, 20)
+	opts := cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FormatInteractions,
+	}
+
+	go func() {
+		defer close(out)
+		exec.streamDevinFrames(
+			ctx,
+			&buf,
+			cliproxyexecutor.Request{Model: "devin/swe-2"},
+			opts,
+			"swe-2-high",
+			sdktranslator.FormatInteractions,
+			reporter,
+			out,
+		)
+	}()
+
+	for range out {
+	}
+
+	record := capture.await(t)
+	if record.Model != "devin/swe-2" {
+		t.Fatalf("record model = %q, want devin/swe-2", record.Model)
+	}
+	if record.ResponseModel != "gpt-5-6-luna-low" {
+		t.Fatalf("record response model = %q, want gpt-5-6-luna-low", record.ResponseModel)
+	}
+}
+
+func TestDevinStreamEmptyWhenNoModelNameInUsage(t *testing.T) {
+	const alias = "devin-stream-no-model-test"
+	capture := &multiProviderUsageCapture{alias: alias, records: make(chan coreusage.Record, 4)}
+	coreusage.RegisterNamedPlugin(t.Name(), capture)
+	t.Cleanup(func() {
+		coreusage.RegisterNamedPlugin(t.Name(), multiProviderNoopUsagePlugin{})
+	})
+
+	ctx := coreusage.WithRequestedModelAlias(context.Background(), alias)
+	auth := &cliproxyauth.Auth{ID: "devin-auth-2", Index: "auth-devin-2", Provider: "devin"}
+	exec := NewDevinExecutor(&config.Config{})
+	reporter := helps.NewExecutorUsageReporter(ctx, exec, "devin/swe-2", auth)
+
+	var f7 []byte
+	f7 = protowire.AppendTag(f7, 2, protowire.VarintType)
+	f7 = protowire.AppendVarint(f7, 10)
+	f7 = protowire.AppendTag(f7, 3, protowire.VarintType)
+	f7 = protowire.AppendVarint(f7, 20)
+
+	var f1 []byte
+	f1 = protowire.AppendTag(f1, 7, protowire.BytesType)
+	f1 = protowire.AppendBytes(f1, f7)
+
+	var buf bytes.Buffer
+	buf.Write(helps.WrapConnectEnvelope(f1))
+	buf.Write(helps.WrapConnectEnvelopeWithFlag(helps.ConnectFlagEndStream, []byte(`{}`)))
+
+	out := make(chan cliproxyexecutor.StreamChunk, 20)
+	opts := cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FormatInteractions,
+	}
+
+	go func() {
+		defer close(out)
+		exec.streamDevinFrames(
+			ctx,
+			&buf,
+			cliproxyexecutor.Request{Model: "devin/swe-2"},
+			opts,
+			"swe-2-high",
+			sdktranslator.FormatInteractions,
+			reporter,
+			out,
+		)
+	}()
+
+	for range out {
+	}
+
+	record := capture.await(t)
+	if record.ResponseModel != "" {
+		t.Fatalf("record response model = %q, want empty string when unknown", record.ResponseModel)
+	}
+}
+
+func TestDevinNonStreamRecordsResponseModelFromUsage(t *testing.T) {
+	const alias = "devin-nonstream-response-model-test"
+	capture := &multiProviderUsageCapture{alias: alias, records: make(chan coreusage.Record, 4)}
+	coreusage.RegisterNamedPlugin(t.Name(), capture)
+	t.Cleanup(func() {
+		coreusage.RegisterNamedPlugin(t.Name(), multiProviderNoopUsagePlugin{})
+	})
+
+	ctx := coreusage.WithRequestedModelAlias(context.Background(), alias)
+	auth := &cliproxyauth.Auth{ID: "devin-auth-3", Index: "auth-devin-3", Provider: "devin"}
+	exec := NewDevinExecutor(&config.Config{})
+	reporter := helps.NewExecutorUsageReporter(ctx, exec, "devin/swe-2", auth)
+
+	var f7 []byte
+	f7 = protowire.AppendTag(f7, 2, protowire.VarintType)
+	f7 = protowire.AppendVarint(f7, 10)
+	f7 = protowire.AppendTag(f7, 3, protowire.VarintType)
+	f7 = protowire.AppendVarint(f7, 20)
+	f7 = protowire.AppendTag(f7, 9, protowire.BytesType)
+	f7 = protowire.AppendString(f7, "gpt-5-6-luna-low")
+
+	var f1 []byte
+	f1 = protowire.AppendTag(f1, 7, protowire.BytesType)
+	f1 = protowire.AppendBytes(f1, f7)
+
+	var buf bytes.Buffer
+	buf.Write(helps.WrapConnectEnvelope(f1))
+	buf.Write(helps.WrapConnectEnvelopeWithFlag(helps.ConnectFlagEndStream, []byte(`{}`)))
+
+	interactionsJSON, respLog, errConsume := consumeDevinFramesToInteractions(&buf, "devin/swe-2", "chat-model-uid")
+	if errConsume != nil {
+		t.Fatalf("consumeDevinFramesToInteractions failed: %v", errConsume)
+	}
+
+	if respLog != nil && respLog.Usage != nil && respLog.Usage.ModelName != "" {
+		reporter.SetResponseModel(respLog.Usage.ModelName)
+	}
+	reporter.Publish(ctx, helps.ParseInteractionsUsage(interactionsJSON))
+
+	record := capture.await(t)
+	if record.ResponseModel != "gpt-5-6-luna-low" {
+		t.Fatalf("record response model = %q, want gpt-5-6-luna-low", record.ResponseModel)
 	}
 }

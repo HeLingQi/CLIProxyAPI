@@ -10,6 +10,9 @@ const (
 	SignatureProviderGemini       SignatureProvider = "gemini"
 	SignatureProviderGeminiBypass SignatureProvider = "gemini_bypass"
 	SignatureProviderGPT          SignatureProvider = "gpt"
+	// SignatureProviderKimi is identified by fixed signature size rather than by
+	// an envelope. See kimi_validation.go for the empirical basis and its limits.
+	SignatureProviderKimi SignatureProvider = "kimi"
 	// SignatureProviderGrok is a target-only family. DetectSignatureProvider never
 	// returns it: xAI emits no envelope, no version byte and no fixed length, and
 	// its ciphertext is statistically indistinguishable from uniform random bytes,
@@ -19,6 +22,12 @@ const (
 	SignatureProviderGrok SignatureProvider = "grok"
 	// SignatureProviderSWE represents Cognition's SWE model family emitting sealed.v1 envelopes.
 	SignatureProviderSWE SignatureProvider = "swe"
+	// SignatureProviderMeta is identified by the observed Meta Muse envelope:
+	// a fixed five-byte header plus a power-of-two padded payload length,
+	// optionally followed by a router-appended (e.g. OpenRouter) dot suffix
+	// that replays verbatim. See meta_validation.go for the capture basis and
+	// its limits.
+	SignatureProviderMeta SignatureProvider = "meta"
 )
 
 type SignatureBlockKind string
@@ -90,8 +99,15 @@ func signatureProviderFromModelNameValue(lower string) SignatureProvider {
 		strings.HasPrefix(lower, "o3"),
 		strings.HasPrefix(lower, "o4"):
 		return SignatureProviderGPT
+	case strings.Contains(lower, "kimi"),
+		strings.Contains(lower, "moonshot"),
+		strings.HasPrefix(lower, "k2"),
+		strings.HasPrefix(lower, "k3"):
+		return SignatureProviderKimi
 	case strings.Contains(lower, "grok"):
 		return SignatureProviderGrok
+	case isMetaMuseModelName(lower):
+		return SignatureProviderMeta
 	case strings.Contains(lower, "swe-"):
 		return SignatureProviderSWE
 	default:
@@ -268,6 +284,9 @@ func DetectSignatureProviderForBlock(rawSignature string, blockKind SignatureBlo
 		if IsValidGPTReasoningSignature(sig) {
 			return SignatureProviderGPT
 		}
+		if IsValidMetaReasoningSignature(sig) {
+			return SignatureProviderMeta
+		}
 		if IsValidClaudeCAISSignature(sig) {
 			return SignatureProviderClaude
 		}
@@ -277,6 +296,14 @@ func DetectSignatureProviderForBlock(rawSignature string, blockKind SignatureBlo
 		if isRecognizedGeminiProviderSignature(sig, blockKind) {
 			return SignatureProviderGemini
 		}
+	}
+	// Kimi carries no envelope, so it can only be claimed once every
+	// self-describing probe above has declined. Ordering it last means a length
+	// coincidence can never capture another provider's signature, and a future
+	// drift in Kimi's sizes costs Kimi its own identification rather than
+	// corrupting a neighbouring family.
+	if IsValidKimiThinkingSignature(sig) {
+		return SignatureProviderKimi
 	}
 	return SignatureProviderUnknown
 }
@@ -348,6 +375,18 @@ func DecideSignatureCompatibilityForModel(targetProvider SignatureProvider, targ
 	case SignatureProviderSWE:
 		decision.Action = SignatureActionDropBlock
 		decision.Reason = "SWE requires sealed.v1 signature from its own backend"
+	case SignatureProviderMeta:
+		decision.Action = SignatureActionDropBlock
+		decision.Reason = "Meta Muse requires its native encrypted_content envelope and has no cross-provider bypass sentinel"
+	case SignatureProviderKimi:
+		// Kimi is the only target that can keep the reasoning text when the
+		// signature does not match. Its Messages endpoint never reads the field
+		// back: a mutated, truncated, non-base64 or absent signature all return
+		// 200, because reasoning continuity there travels in OpenAI-style
+		// reasoning_content instead. Dropping the block would discard recoverable
+		// thinking text for no upstream benefit, so drop only the signature.
+		decision.Action = SignatureActionDropSignature
+		decision.Reason = "Kimi does not validate replayed thinking signatures, so the block survives without one"
 	case SignatureProviderGrok:
 		// xAI decrypts encrypted_content and rejects the request with 400
 		// "Could not decrypt" when the blob is foreign or mutated, so a
@@ -483,6 +522,10 @@ func signatureProviderMatchesTarget(target, detected SignatureProvider) bool {
 		return detected == SignatureProviderGPT
 	case SignatureProviderSWE:
 		return detected == SignatureProviderSWE
+	case SignatureProviderMeta:
+		return detected == SignatureProviderMeta
+	case SignatureProviderKimi:
+		return detected == SignatureProviderKimi
 	default:
 		// SignatureProviderGrok is deliberately absent. Detection never yields it,
 		// so a Grok target must decide replay safety from provenance plus
@@ -516,6 +559,14 @@ func normalizeCompatibleSignatureForProvider(targetProvider SignatureProvider, r
 		}
 	case SignatureProviderSWE:
 		if strings.HasPrefix(payload, "sealed.v1.") {
+			return payload
+		}
+	case SignatureProviderMeta:
+		if IsValidMetaReasoningSignature(payload) {
+			return payload
+		}
+	case SignatureProviderKimi:
+		if IsValidKimiThinkingSignature(payload) {
 			return payload
 		}
 	}

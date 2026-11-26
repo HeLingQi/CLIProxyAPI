@@ -11,7 +11,7 @@ import (
 // ResolveCodexReplayTargetModel returns the model name to use for reasoning
 // signature family checks, falling back to the client-supplied "model" field in
 // rawPayload when modelName is an unmapped upstream deployment alias for a
-// Responses-native model family (Grok or GPT).
+// Responses-native model family (Meta Muse, Grok, or GPT).
 func ResolveCodexReplayTargetModel(modelName string, rawPayload []byte) string {
 	if sigcompat.SignatureProviderFromModelName(thinking.ParseSuffix(modelName).ModelName) != sigcompat.SignatureProviderUnknown {
 		return modelName
@@ -19,7 +19,7 @@ func ResolveCodexReplayTargetModel(modelName string, rawPayload []byte) string {
 	if len(rawPayload) > 0 {
 		if rawModel := strings.TrimSpace(ojson.GetBytesNoCopy(rawPayload, "model").String()); rawModel != "" {
 			switch sigcompat.SignatureProviderFromModelName(thinking.ParseSuffix(rawModel).ModelName) {
-			case sigcompat.SignatureProviderGrok, sigcompat.SignatureProviderGPT:
+			case sigcompat.SignatureProviderMeta, sigcompat.SignatureProviderGrok, sigcompat.SignatureProviderGPT:
 				return strings.Clone(rawModel)
 			}
 		}

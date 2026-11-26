@@ -141,6 +141,9 @@ func applyClaudeCLIIdentity(body []byte, auth *cliproxyauth.Auth, apiKey, upstre
 
 func applyClaudeCLIIdentityDoc(doc *ojson.Doc, auth *cliproxyauth.Auth, apiKey, upstreamURL, sessionID string, synthesize bool) error {
 	identitySeed := apiKey
+	if isKimiMessagesUpstream(auth, upstreamURL) {
+		identitySeed = helps.ClaudeCLIAuthIdentitySeed(auth)
+	}
 	identityAuth, errIdentity := helps.PrepareClaudeCLIFingerprintAuth(auth, identitySeed, synthesize)
 	if errIdentity != nil {
 		return fmt.Errorf("ensure Claude CLI fingerprint identity: %w", errIdentity)

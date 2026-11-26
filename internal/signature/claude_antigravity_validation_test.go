@@ -40,7 +40,7 @@ func TestAntigravityCAQSRecognitionAndReplay(t *testing.T) {
 		if normalized, ok := CompatibleAntigravityClaudeThinkingSignature(sig); !ok || normalized != sig {
 			t.Fatalf("channel %d: Antigravity replay must preserve the original bytes", channelID)
 		}
-		for _, target := range []SignatureProvider{SignatureProviderClaude, SignatureProviderGemini, SignatureProviderGPT, SignatureProviderGrok} {
+		for _, target := range []SignatureProvider{SignatureProviderClaude, SignatureProviderGemini, SignatureProviderGPT, SignatureProviderKimi, SignatureProviderGrok} {
 			if d := DecideSignatureCompatibility(target, sig, SignatureBlockKindClaudeThinking); d.Compatible {
 				t.Errorf("channel %d: Google wrapper must not be replayed directly to %s", channelID, target)
 			}

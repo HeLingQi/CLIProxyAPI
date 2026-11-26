@@ -436,4 +436,70 @@ func TestOpenAICompatMultilineSSEAndXAIOutputItemDoneUsage(t *testing.T) {
 			t.Fatalf("multiline SSE lost usage: %+v", rec.Detail)
 		}
 	})
+
+	t.Run("xai_output_item_done_with_empty_completed_output", func(t *testing.T) {
+		sseBody := strings.Join([]string{
+			"event: response.output_item.done",
+			`data: {"type":"response.output_item.done","output_index":0,"item":{"id":"ct_1","type":"custom_tool_call","status":"completed","call_id":"xs_1","name":"x_keyword_search","input":"{}"}}`,
+			"",
+			"event: response.output_item.done",
+			`data: {"type":"response.output_item.done","output_index":1,"item":{"id":"fc_1","type":"function_call","status":"completed","call_id":"call_1","name":"lookup","arguments":"{}"}}`,
+			"",
+			"event: response.completed",
+			`data: {"type":"response.completed","response":{"id":"resp_1","model":"grok-4","status":"completed","output":[],"usage":{"input_tokens":20,"output_tokens":10,"total_tokens":30}}}`,
+			"",
+		}, "\n")
+
+		for _, stream := range []bool{false, true} {
+			t.Run(fmt.Sprintf("stream=%v", stream), func(t *testing.T) {
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = fmt.Fprint(w, sseBody)
+				}))
+				defer srv.Close()
+
+				alias := t.Name()
+				capture := &multiProviderUsageCapture{alias: alias, records: make(chan coreusage.Record, 4)}
+				coreusage.RegisterNamedPlugin(t.Name(), capture)
+				t.Cleanup(func() {
+					coreusage.RegisterNamedPlugin(t.Name(), multiProviderNoopUsagePlugin{})
+				})
+				ctx := coreusage.WithRequestedModelAlias(context.Background(), alias)
+				exec := NewXAIExecutor(&config.Config{})
+				auth := &cliproxyauth.Auth{
+					Provider:   "xai",
+					Attributes: map[string]string{"base_url": srv.URL, "api_key": "xai-test"},
+				}
+				req := cliproxyexecutor.Request{
+					Model:   "grok-4",
+					Payload: []byte(`{"model":"grok-4","input":"hi","tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}]}`),
+				}
+				opts := cliproxyexecutor.Options{
+					SourceFormat: sdktranslator.FormatOpenAIResponse,
+					Stream:       stream,
+				}
+				if stream {
+					res, err := exec.ExecuteStream(ctx, auth, req, opts)
+					if err != nil {
+						t.Fatal(err)
+					}
+					for chunk := range res.Chunks {
+						if chunk.Err != nil {
+							t.Fatal(chunk.Err)
+						}
+					}
+				} else {
+					if _, err := exec.Execute(ctx, auth, req, opts); err != nil {
+						t.Fatal(err)
+					}
+				}
+				rec := capture.await(t)
+				if rec.Detail.ToolUsageDetails == nil ||
+					rec.Detail.ToolUsageDetails.XSearchCalls == nil || *rec.Detail.ToolUsageDetails.XSearchCalls != 1 ||
+					rec.Detail.ToolUsageDetails.ToolCallsRequested == nil || *rec.Detail.ToolUsageDetails.ToolCallsRequested != 1 {
+					t.Fatalf("lost output_item.done tool usage: %+v", rec.Detail.ToolUsageDetails)
+				}
+			})
+		}
+	})
 }

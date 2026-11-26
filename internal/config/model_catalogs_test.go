@@ -13,7 +13,7 @@ func TestModelCatalogConfigRoundTrip(t *testing.T) {
 	for _, migrate := range []bool{false, true} {
 		t.Run(fmt.Sprint(migrate), func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "config.yaml")
-			sources := ModelCatalogs{Catalog: filepath.Join(t.TempDir(), "models.json"), CodexCatalog: "https://example.com/codex.json"}
+			sources := ModelCatalogs{Catalog: filepath.Join(t.TempDir(), "models.json"), CodexCatalog: "https://example.com/codex.json", DevinCatalog: "http://localhost/devin.json"}
 			data, errMarshal := yaml.Marshal(map[string]any{"config-version": 8, "models": sources})
 			if errMarshal != nil {
 				t.Fatal(errMarshal)
@@ -65,7 +65,7 @@ func TestModelCatalogConfigRoundTrip(t *testing.T) {
 }
 
 func TestModelCatalogConfigValidation(t *testing.T) {
-	for _, field := range []string{"catalog", "codex-catalog"} {
+	for _, field := range []string{"catalog", "codex-catalog", "devin-catalog"} {
 		for _, source := range []string{"relative.json", "./models.json", "~/models.json", "ftp://example.com/models", "file:///tmp/models.json", "https:///models"} {
 			data := []byte(fmt.Sprintf("models:\n  %s: %q\n", field, source))
 			var cfg Config

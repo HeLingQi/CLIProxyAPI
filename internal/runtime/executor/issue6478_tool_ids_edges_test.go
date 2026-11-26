@@ -4,16 +4,143 @@ import (
 	"context"
 	"io"
 	"net/http"
-	"regexp"
+	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/MoeForge/moego/ojson"
+	"github.com/MoeForge/moego/regexp"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 )
+
+func TestIssue6478_DevinReservedPrefixStatelessFragmentedRoundTrip(t *testing.T) {
+	nativeIDs := []string{"Write:1#abc", "cpa_tid_v1_V3JpdGU6MSNhYmM", "cpa_tid_v1_Y2FsbF8x", "call_1"}
+	var frames []byte
+	for i, id := range nativeIDs {
+		for j, args := range []string{`{"literal_id":`, `"Write:1#abc"}`} {
+			tool := appendVarintField(nil, 4, uint64(i))
+			if j == 0 {
+				tool = appendDevinFieldBytes(tool, 1, []byte(id))
+				tool = appendDevinFieldBytes(tool, 2, []byte(issue6478Calls[i].name))
+			}
+			tool = appendDevinFieldBytes(tool, 3, []byte(args))
+			frames = append(frames, helps.WrapConnectEnvelope(appendDevinFieldBytes(nil, 6, tool))...)
+		}
+	}
+	frames = append(frames, helps.WrapConnectEnvelopeWithFlag(helps.ConnectFlagEndStream, []byte(`{}`))...)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/connect+proto")
+		if _, errWrite := w.Write(frames); errWrite != nil {
+			t.Errorf("write frames: %v", errWrite)
+		}
+	}))
+	defer server.Close()
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "test", "base_url": server.URL}}
+	var idsByMode [][]string
+	for _, stream := range []bool{false, true} {
+		name := "Execute"
+		if stream {
+			name = "ExecuteStream"
+		}
+		t.Run(name, func(t *testing.T) {
+			executor := NewDevinExecutor(&config.Config{})
+			payload := []byte(`{"model":"devin/swe-2","messages":[{"role":"user","content":"tools"}]}`)
+			req := cliproxyexecutor.Request{Model: "devin/swe-2", Payload: payload}
+			opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude, OriginalRequest: payload, Stream: stream}
+			var ids, arguments []string
+			if stream {
+				result, errStream := executor.ExecuteStream(t.Context(), auth, req, opts)
+				if errStream != nil {
+					t.Fatal(errStream)
+				}
+				for chunk := range result.Chunks {
+					if chunk.Err != nil {
+						t.Fatal(chunk.Err)
+					}
+					for _, line := range strings.Split(string(chunk.Payload), "\n") {
+						event := ojson.Parse(strings.TrimPrefix(line, "data: "))
+						if event.Get("content_block.type").String() == "tool_use" {
+							ids = append(ids, event.Get("content_block.id").String())
+							arguments = append(arguments, "")
+						}
+						if event.Get("delta.type").String() == "input_json_delta" && len(arguments) > 0 {
+							arguments[len(arguments)-1] += event.Get("delta.partial_json").String()
+						}
+					}
+				}
+			} else {
+				result, errExecute := executor.Execute(t.Context(), auth, req, opts)
+				if errExecute != nil {
+					t.Fatal(errExecute)
+				}
+				for _, block := range ojson.GetBytes(result.Payload, "content").Array() {
+					if block.Get("type").String() == "tool_use" {
+						ids = append(ids, block.Get("id").String())
+						arguments = append(arguments, block.Get("input").Raw)
+					}
+				}
+			}
+			if len(ids) != 4 {
+				t.Fatalf("IDs = %q, want four calls", ids)
+			}
+			seen := make(map[string]bool)
+			for i, id := range ids {
+				if !regexp.MustCompile(`^[a-zA-Z0-9_-]+$`).MatchString(id) || seen[id] {
+					t.Errorf("non-portable or colliding ID[%d] = %q", i, id)
+				}
+				seen[id] = true
+				if i < 3 && id == nativeIDs[i] {
+					t.Errorf("illegal or reserved native ID[%d] was not escaped: %q", i, id)
+				}
+				if ojson.Get(arguments[i], "literal_id").String() != "Write:1#abc" {
+					t.Errorf("fragmented arguments corrupted: %s", arguments[i])
+				}
+			}
+			if ids[3] != "call_1" {
+				t.Errorf("ordinary valid ID changed to %q", ids[3])
+			}
+			idsByMode = append(idsByMode, ids)
+
+			// A fresh executor has no state from the response that minted these IDs.
+			fresh := NewDevinExecutor(&config.Config{})
+			req.Payload = issue6478History(ids)
+			opts.OriginalRequest = req.Payload
+			httpReq, _, _, errPrepare := fresh.prepareDevinHTTPRequest(t.Context(), auth, req, opts)
+			if errPrepare != nil {
+				t.Fatal(errPrepare)
+			}
+			defer func() {
+				if errClose := httpReq.Body.Close(); errClose != nil {
+					t.Error(errClose)
+				}
+			}()
+			_, wire, errRead := helps.ReadConnectFrame(httpReq.Body)
+			if errRead != nil {
+				t.Fatal(errRead)
+			}
+			_, body, errDecode := helps.FinalizeDevinPayload(wire, func(body []byte) []byte { return body })
+			if errDecode != nil {
+				t.Fatal(errDecode)
+			}
+			for i, id := range nativeIDs {
+				if got := ojson.GetBytes(body, "prompts.1.tool_calls").Array()[i].Get("id").String(); got != id {
+					t.Errorf("stateless call[%d] = %q, want original %q", i, got, id)
+				}
+				if got := ojson.GetBytes(body, "prompts").Array()[i+2].Get("tool_call_id").String(); got != id {
+					t.Errorf("stateless result[%d] = %q, want original %q", i, got, id)
+				}
+			}
+		})
+	}
+	if len(idsByMode) == 2 && !slices.Equal(idsByMode[0], idsByMode[1]) {
+		t.Errorf("fragmented stream IDs differ: %q vs %q", idsByMode[0], idsByMode[1])
+	}
+}
 
 func TestIssue6478_ClaudeLegacyEncodingCollision(t *testing.T) {
 	ids := []string{issue6478Calls[0].id, issue6478Calls[1].id, "cpa_tid_v1_V3JpdGU6MSNlMWYwZGE4MTE0MzY0OWYzYTM3OGQyNGFmNmZjM2VjOQ", "call_8jAZYBK5veMdr1DD2DqObARK"}
@@ -95,6 +222,25 @@ func TestIssue6478_ClaudeUpstreamCountTokensRepairBeforePayload(t *testing.T) {
 					t.Errorf("count_tokens changed legal ID[%d]: %q", i, id.String())
 				}
 			}
+		}
+	}
+}
+
+func TestIssue6478_DevinDoesNotDecodeOrdinaryNativeIDs(t *testing.T) {
+	ids := []string{"call_1", "cpa_tid_v1_Y2FsbF8x", "cpa_tid_v1_not_base64!", "cpa_tid_v1_"}
+	httpReq, _, body, errPrepare := NewDevinExecutor(&config.Config{}).prepareDevinHTTPRequest(t.Context(), &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "test"}}, cliproxyexecutor.Request{Model: "devin/swe-2", Payload: issue6478History(ids)}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude})
+	if errPrepare != nil {
+		t.Fatal(errPrepare)
+	}
+	defer func() {
+		if errClose := httpReq.Body.Close(); errClose != nil {
+			t.Error(errClose)
+		}
+	}()
+	for i, id := range ids {
+		got := ojson.GetBytes(body, "prompts.1.tool_calls").Array()[i].Get("id").String()
+		if got != id {
+			t.Errorf("ordinary native ID was misdecoded: %q, want %q", got, id)
 		}
 	}
 }

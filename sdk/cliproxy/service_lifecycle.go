@@ -12,6 +12,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/pricing"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor/helps"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/usagehistory"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v8/sdk/access"
@@ -121,6 +122,7 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 
 	if !homeEnabled {
+		s.startCopilotCatalogRefresh(ctx)
 		tokenResult, err := s.tokenProvider.Load(ctx, cfg)
 		if err != nil && !errors.Is(err, context.Canceled) {
 			return err
@@ -287,6 +289,17 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		s.homeMu.Unlock()
 		if runCancel != nil {
 			runCancel()
+		}
+		s.cfgMu.RLock()
+		catalogs := s.copilotCatalogs
+		s.cfgMu.RUnlock()
+		if catalogs != nil {
+			catalogs.cancel()
+			select {
+			case <-catalogs.done:
+			case <-ctx.Done():
+				shutdownErr = ctx.Err()
+			}
 		}
 
 		s.homeLifecycleMu.Lock()
@@ -465,7 +478,19 @@ func (s *Service) startModelCatalogUpdaters(ctx context.Context) {
 	s.cfgMu.RLock()
 	cfg := s.cfg
 	s.cfgMu.RUnlock()
+	proxyURL := ""
 	if cfg != nil {
 		registry.StartModelCatalogUpdaters(ctx, cfg.Models, cfg.Home.Enabled)
+		proxyURL = cfg.ProxyURL
 	}
+	executor.StartXAIVersionUpdater(ctx, proxyURL)
+	sdkAuth.StartAntigravityVersionUpdaterWithProxyProvider(ctx, s.antigravityVersionProxyURL)
+}
+
+func (s *Service) antigravityVersionProxyURL() string {
+	cfg := s.currentConfig()
+	if cfg == nil {
+		return ""
+	}
+	return cfg.ProxyURL
 }

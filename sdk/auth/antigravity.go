@@ -43,29 +43,19 @@ func (AntigravityAuthenticator) Login(ctx context.Context, cfg *config.Config, o
 		opts = &LoginOptions{}
 	}
 
-	// Interactive desktop logins use an ephemeral loopback port (0), matching the
-	// official client where every login gets its own redirect_uri. Headless / SSH
-	// / container logins without an available local browser fall back to the
-	// deterministic callback port so port-forwarding (-p 51121:51121 / ssh -L)
-	// remains predictable when the caller did not specify an explicit port.
-	callbackPort := opts.CallbackPort
-	if callbackPort == 0 && (opts.NoBrowser || !browser.IsAvailable()) {
-		callbackPort = antigravity.CallbackPort
+	callbackPort := antigravity.CallbackPort
+	if opts.CallbackPort > 0 {
+		callbackPort = opts.CallbackPort
 	}
 
 	authSvc := antigravity.NewAntigravityAuth(cfg, nil)
-	if codes, errPKCE := antigravity.GeneratePKCECodes(); errPKCE == nil {
-		authSvc = antigravity.NewAntigravityAuthWithPKCE(cfg, nil, codes)
-	} else {
-		log.Warnf("antigravity: PKCE unavailable, logging in without a code challenge: %v", errPKCE)
-	}
 
 	state, err := misc.GenerateRandomState()
 	if err != nil {
 		return nil, fmt.Errorf("antigravity: failed to generate state: %w", err)
 	}
 
-	srv, port, cbChan, errServer := startAntigravityCallbackServer(callbackPort, antigravity.CallbackPath, state)
+	srv, port, cbChan, errServer := startAntigravityCallbackServer(callbackPort)
 	if errServer != nil {
 		return nil, fmt.Errorf("antigravity: failed to start callback server: %w", errServer)
 	}
@@ -75,7 +65,7 @@ func (AntigravityAuthenticator) Login(ctx context.Context, cfg *config.Config, o
 		_ = srv.Shutdown(shutdownCtx)
 	}()
 
-	redirectURI := fmt.Sprintf("http://localhost:%d%s", port, antigravity.CallbackPath)
+	redirectURI := fmt.Sprintf("http://localhost:%d/oauth-callback", port)
 	authURL := authSvc.BuildAuthURL(state, redirectURI)
 
 	if !opts.NoBrowser {
@@ -215,53 +205,11 @@ type callbackResult struct {
 	State string
 }
 
-func newAntigravityCallbackHandler(callbackPath, expectedState string, resultCh chan<- callbackResult) http.Handler {
-	if strings.TrimSpace(callbackPath) == "" {
-		callbackPath = antigravity.CallbackPath
-	}
-	mux := http.NewServeMux()
-	mux.HandleFunc(callbackPath, func(w http.ResponseWriter, r *http.Request) {
-		q := r.URL.Query()
-		res := callbackResult{
-			Code:  strings.TrimSpace(q.Get("code")),
-			Error: strings.TrimSpace(q.Get("error")),
-			State: strings.TrimSpace(q.Get("state")),
-		}
-		if res.Code == "" && res.Error == "" {
-			w.WriteHeader(http.StatusBadRequest)
-			_, _ = w.Write([]byte("<h1>Invalid callback</h1><p>Missing authorization code.</p>"))
-			return
-		}
-		if expectedState != "" && res.State != expectedState && !(res.Code == "" && res.Error != "" && res.State == "") {
-			w.WriteHeader(http.StatusBadRequest)
-			_, _ = w.Write([]byte("<h1>Invalid callback</h1><p>State mismatch.</p>"))
-			return
-		}
-		select {
-		case resultCh <- res:
-		default:
-		}
-		if res.Code != "" && res.Error == "" {
-			_, _ = w.Write([]byte("<h1>Login successful</h1><p>You can close this window.</p>"))
-		} else {
-			_, _ = w.Write([]byte("<h1>Login failed</h1><p>Please check the CLI output.</p>"))
-		}
-	})
-	return mux
-}
-
-func antigravityCallbackListenAddr(port int) string {
-	if port < 0 {
+func startAntigravityCallbackServer(port int) (*http.Server, int, <-chan callbackResult, error) {
+	if port <= 0 {
 		port = antigravity.CallbackPort
 	}
-	if port == 0 {
-		return "127.0.0.1:0"
-	}
-	return fmt.Sprintf(":%d", port)
-}
-
-func startAntigravityCallbackServer(port int, callbackPath, expectedState string) (*http.Server, int, <-chan callbackResult, error) {
-	addr := antigravityCallbackListenAddr(port)
+	addr := fmt.Sprintf(":%d", port)
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, 0, nil, err
@@ -269,7 +217,23 @@ func startAntigravityCallbackServer(port int, callbackPath, expectedState string
 	port = listener.Addr().(*net.TCPAddr).Port
 	resultCh := make(chan callbackResult, 1)
 
-	srv := &http.Server{Handler: newAntigravityCallbackHandler(callbackPath, expectedState, resultCh)}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/oauth-callback", func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		res := callbackResult{
+			Code:  strings.TrimSpace(q.Get("code")),
+			Error: strings.TrimSpace(q.Get("error")),
+			State: strings.TrimSpace(q.Get("state")),
+		}
+		resultCh <- res
+		if res.Code != "" && res.Error == "" {
+			_, _ = w.Write([]byte("<h1>Login successful</h1><p>You can close this window.</p>"))
+		} else {
+			_, _ = w.Write([]byte("<h1>Login failed</h1><p>Please check the CLI output.</p>"))
+		}
+	})
+
+	srv := &http.Server{Handler: mux}
 	go func() {
 		if errServe := srv.Serve(listener); errServe != nil && !strings.Contains(errServe.Error(), "Server closed") {
 			log.Warnf("antigravity callback server error: %v", errServe)
@@ -299,25 +263,34 @@ type AntigravityTokenResponse struct {
 
 // AntigravityDefaultCallbackURI returns the default loopback redirect URI for Antigravity OAuth.
 func AntigravityDefaultCallbackURI() string {
-	return fmt.Sprintf("http://localhost:%d%s", AntigravityDefaultCallbackPort, antigravity.CallbackPath)
-}
-
-// AntigravityPKCECodes is the RFC 7636 verifier and challenge pair used by the
-// Antigravity login flow.
-type AntigravityPKCECodes = antigravity.PKCECodes
-
-// NewAntigravityPKCECodes creates the pair for a login whose authorization URL and
-// code exchange happen in separate calls. Pass it to
-// BuildAntigravityAuthURLWithPKCE and ExchangeAntigravityCodeWithPKCE; the
-// PKCE-free BuildAntigravityAuthURL and ExchangeAntigravityCode pair cannot carry
-// one and therefore still logs in without a code challenge.
-func NewAntigravityPKCECodes() (*AntigravityPKCECodes, error) {
-	return antigravity.GeneratePKCECodes()
+	return fmt.Sprintf("http://localhost:%d/oauth-callback", AntigravityDefaultCallbackPort)
 }
 
 // AntigravityUserAgent returns the canonical User-Agent string used by the Antigravity Hub family.
 func AntigravityUserAgent() string {
 	return misc.AntigravityUserAgent()
+}
+
+// StartAntigravityVersionUpdater starts background refresh for the Antigravity Hub version
+// using the inherited process environment proxy settings. If an updater is already active,
+// this call is a no-op and preserves the active updater and its proxy configuration.
+func StartAntigravityVersionUpdater(ctx context.Context) {
+	misc.StartAntigravityVersionUpdater(ctx)
+}
+
+// StartAntigravityVersionUpdaterWithProxy starts background refresh for the Antigravity Hub
+// version using the configured proxyURL. An empty proxyURL inherits process environment proxies,
+// while "direct" or "none" bypasses them. A later call cancels any previous updater goroutine
+// and binds the new context and proxy URL.
+func StartAntigravityVersionUpdaterWithProxy(ctx context.Context, proxyURL string) {
+	misc.StartAntigravityVersionUpdaterWithProxy(ctx, proxyURL)
+}
+
+// StartAntigravityVersionUpdaterWithProxyProvider starts background refresh for the Antigravity Hub
+// version using proxyProvider to resolve the active proxy setting on each fetch. A later call
+// cancels any previous updater goroutine and binds the new context and proxy provider.
+func StartAntigravityVersionUpdaterWithProxyProvider(ctx context.Context, proxyProvider func() string) {
+	misc.StartAntigravityVersionUpdaterWithProxyProvider(ctx, proxyProvider)
 }
 
 // AntigravityRequestUserAgent returns the User-Agent for Antigravity runtime requests,
@@ -329,28 +302,16 @@ func AntigravityRequestUserAgent(userAgent string) string {
 // BuildAntigravityAuthURL generates the OAuth authorization URL for Antigravity.
 // If redirectURI is empty, the default loopback callback URI is used.
 func BuildAntigravityAuthURL(state, redirectURI string) string {
-	return BuildAntigravityAuthURLWithPKCE(state, redirectURI, nil)
-}
-
-// BuildAntigravityAuthURLWithPKCE generates the authorization URL and advertises
-// codes.Challenge when a PKCE pair was created for the login.
-func BuildAntigravityAuthURLWithPKCE(state, redirectURI string, codes *AntigravityPKCECodes) string {
-	authSvc := antigravity.NewAntigravityAuthWithPKCE(nil, nil, codes)
+	authSvc := antigravity.NewAntigravityAuth(nil, nil)
 	return authSvc.BuildAuthURL(state, redirectURI)
 }
 
 // ExchangeAntigravityCode exchanges an authorization code for access and refresh tokens.
 func ExchangeAntigravityCode(ctx context.Context, code, redirectURI string, httpClient *http.Client) (*AntigravityTokenResponse, error) {
-	return ExchangeAntigravityCodeWithPKCE(ctx, code, redirectURI, nil, httpClient)
-}
-
-// ExchangeAntigravityCodeWithPKCE exchanges an authorization code, presenting the
-// verifier that belongs to the challenge used to obtain it.
-func ExchangeAntigravityCodeWithPKCE(ctx context.Context, code, redirectURI string, codes *AntigravityPKCECodes, httpClient *http.Client) (*AntigravityTokenResponse, error) {
 	if strings.TrimSpace(redirectURI) == "" {
 		redirectURI = AntigravityDefaultCallbackURI()
 	}
-	authSvc := antigravity.NewAntigravityAuthWithPKCE(nil, httpClient, codes)
+	authSvc := antigravity.NewAntigravityAuth(nil, httpClient)
 	tokenResp, errExchange := authSvc.ExchangeCodeForTokens(ctx, code, redirectURI)
 	if errExchange != nil {
 		return nil, errExchange
@@ -413,14 +374,7 @@ func BuildAntigravityAuth(tokenResp *AntigravityTokenResponse, email, projectID 
 // CompleteAntigravityOAuth performs code exchange, user identity retrieval, and GCP project discovery
 // using an injected HTTP client, returning an assembled *coreauth.Auth without touching the filesystem.
 func CompleteAntigravityOAuth(ctx context.Context, code, redirectURI string, httpClient *http.Client) (*coreauth.Auth, error) {
-	return CompleteAntigravityOAuthWithPKCE(ctx, code, redirectURI, nil, httpClient)
-}
-
-// CompleteAntigravityOAuthWithPKCE performs the same steps as
-// CompleteAntigravityOAuth and presents codes.Verifier on the exchange, which is
-// required when the code came from BuildAntigravityAuthURLWithPKCE.
-func CompleteAntigravityOAuthWithPKCE(ctx context.Context, code, redirectURI string, codes *AntigravityPKCECodes, httpClient *http.Client) (*coreauth.Auth, error) {
-	tokenResp, errExchange := ExchangeAntigravityCodeWithPKCE(ctx, code, redirectURI, codes, httpClient)
+	tokenResp, errExchange := ExchangeAntigravityCode(ctx, code, redirectURI, httpClient)
 	if errExchange != nil {
 		return nil, fmt.Errorf("antigravity: token exchange failed: %w", errExchange)
 	}

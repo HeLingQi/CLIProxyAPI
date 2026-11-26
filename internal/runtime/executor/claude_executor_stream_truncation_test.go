@@ -3,7 +3,6 @@ package executor
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MoeForge/moego/json"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
@@ -502,6 +502,56 @@ func (r *failingTailReader) Read(p []byte) (int, error) {
 }
 
 func (r *failingTailReader) Close() error { return nil }
+
+// KimiExecutor.ExecuteStream must check scanner.Err() before synthesizing [DONE]
+// so a mid-stream read error does not emit a synthetic terminal completion chunk first.
+func TestKimiExecutorStreamReadErrorDoesNotSynthesizeDoneBeforeScanError(t *testing.T) {
+	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", kimiRoundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body: &failingTailReader{
+				prefix: strings.NewReader("data: {\"id\":\"chatcmpl-kimi\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"kimi-k2.5\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"part\"},\"finish_reason\":null}]}\n\n"),
+				err:    io.ErrUnexpectedEOF,
+			},
+		}, nil
+	}))
+
+	exec := NewKimiExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		Attributes: map[string]string{},
+		Metadata:   map[string]any{"access_token": "test-kimi-key"},
+	}
+	req := cliproxyexecutor.Request{
+		Model:   "kimi-k2.5",
+		Payload: []byte(`{"model":"kimi-k2.5","messages":[{"role":"user","content":"hi"}],"stream":true}`),
+	}
+
+	result, err := exec.ExecuteStream(ctx, auth, req, cliproxyexecutor.Options{
+		SourceFormat:   sdktranslator.FormatOpenAI,
+		ResponseFormat: sdktranslator.FormatOpenAIResponse,
+		Stream:         true,
+	})
+	if err != nil {
+		t.Fatalf("ExecuteStream() error = %v", err)
+	}
+
+	var output bytes.Buffer
+	var streamErr error
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			streamErr = chunk.Err
+			continue
+		}
+		output.Write(chunk.Payload)
+	}
+	if streamErr == nil {
+		t.Fatalf("expected scan error from KimiExecutor stream, got nil; output=%q", output.String())
+	}
+	if strings.Contains(output.String(), "response.completed") {
+		t.Fatalf("KimiExecutor must not synthesize [DONE] (response.completed) when scanner.Err() != nil; output=%q", output.String())
+	}
+}
 
 // GeminiExecutor and GeminiVertexExecutor must still complete FormatClaude streams
 // when an upstream chunk carries finishReason or promptFeedback.blockReason.
